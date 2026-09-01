@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from textual.widgets import OptionList
 
-from tickytickerwebui.app import (
+from tickytickertextual.app import (
     FileSystemNavigator,
     FileViewerApp,
     NavigationError,

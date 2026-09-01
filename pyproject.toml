@@ -3,7 +3,7 @@ requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "tickytickerwebui"
+name = "tickytickertextual"
 version = "0.1.0"
 description = "A read-only, ranger-style filesystem navigator for the terminal and web"
 readme = "README.md"
@@ -19,8 +19,8 @@ dev = [
 ]
 
 [project.scripts]
-tickytickerwebui = "tickytickerwebui.app:main"
-tickytickerwebui-web = "tickytickerwebui.web:main"
+tickytickertextual = "tickytickertextual.app:main"
+tickytickertextual-web = "tickytickertextual.web:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

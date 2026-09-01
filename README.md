@@ -1,4 +1,4 @@
-# tickytickerwebui
+# tickytickertextual
 
 A small, read-only filesystem navigator with a ranger-like three-pane layout.
 Directories are read only when they are visited or selected; there is no file
@@ -11,20 +11,20 @@ be added later without coupling them to filesystem browsing.
 ## Install
 
 ```bash
-python3 -m venv .venv
-.venv/bin/python -m pip install -e '.[dev]'
+make venv
+make sync
 ```
 
 Run it in a terminal:
 
 ```bash
-.venv/bin/tickytickerwebui /path/to/browse
+make run DIRECTORY=/path/to/browse
 ```
 
 Run the same interface in a browser:
 
 ```bash
-.venv/bin/tickytickerwebui-web /path/to/browse
+make web DIRECTORY=/path/to/browse
 ```
 
 Then open <http://127.0.0.1:8000>. To listen on the network, pass

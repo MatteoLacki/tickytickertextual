@@ -184,7 +184,7 @@ def _listing_text(
 class FileViewerApp(App[None]):
     """Three-pane read-only filesystem navigator."""
 
-    TITLE = "fileviewer"
+    TITLE = "tickytickertextual"
     SUB_TITLE = "read-only · on-demand"
 
     CSS = """

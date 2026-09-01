@@ -31,7 +31,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     if not root.is_dir():
         raise SystemExit(f"Root is not a directory: {root}")
 
-    command_parts = [sys.executable, "-m", "tickytickerwebui.app", str(root)]
+    command_parts = [sys.executable, "-m", "tickytickertextual.app", str(root)]
     if args.show_hidden:
         command_parts.append("--show-hidden")
     command = shlex.join(command_parts)
@@ -40,7 +40,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         command,
         host=args.host,
         port=args.port,
-        title=f"fileviewer · {root}",
+        title=f"tickytickertextual · {root}",
         public_url=args.public_url,
     )
     server.serve()
