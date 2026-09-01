@@ -151,10 +151,13 @@ def format_size(size: int | None) -> str:
     return f"{value:.1f} PiB"
 
 
-def _entry_label(entry: FileEntry) -> Text:
+def _entry_label(entry: FileEntry, *, marked: bool = False) -> Text:
     label = Text(no_wrap=True, overflow="ellipsis")
     if entry.is_dir:
-        label.append("▸ ", style="bold cyan")
+        label.append(
+            "✓ " if marked else "▸ ",
+            style="bold green" if marked else "bold cyan",
+        )
         label.append(entry.name, style="bold cyan")
         label.append("/", style="cyan")
     elif entry.is_symlink:
@@ -185,8 +188,47 @@ def _listing_text(
     return output
 
 
+class CurrentOptionList(OptionList):
+    """Filesystem list with bindings advertised only while it has focus."""
+
+    BINDINGS = [
+        Binding("j,down", "app.cursor_down", "Down", key_display="j/↓"),
+        Binding("k,up", "app.cursor_up", "Up", key_display="k/↑"),
+        Binding("space", "app.select_dataset", "Select .d"),
+        Binding("l,right,enter", "app.open_selected", "Open", key_display="l/→/Enter"),
+        Binding("h,left,backspace", "app.go_parent", "Parent", key_display="h/←/⌫"),
+        Binding("g", "app.first", "First"),
+        Binding("G,shift+g", "app.last", "Last", key_display="G"),
+        Binding(
+            "ctrl+down",
+            "app.focus_selected_pane",
+            "Lower pane",
+            key_display="Ctrl+↓",
+        ),
+        Binding(".", "app.toggle_hidden", "Hidden"),
+        Binding("r", "app.reload", "Reload"),
+        Binding("H,shift+h", "app.show_help", "Help", key_display="Shift+H"),
+    ]
+
+
 class SelectedOptionList(OptionList):
     """Option list with a clickable remove control on each row."""
+
+    BINDINGS = [
+        Binding("j,down", "app.cursor_down", "Down", key_display="j/↓"),
+        Binding("k,up", "app.cursor_up", "Up", key_display="k/↑"),
+        Binding("space", "app.select_dataset", "Choose HeLa"),
+        Binding("x", "app.remove_selected", "Remove"),
+        Binding("g", "app.first", "First"),
+        Binding("G,shift+g", "app.last", "Last", key_display="G"),
+        Binding(
+            "h,ctrl+up",
+            "app.focus_current_pane",
+            "Upper pane",
+            key_display="h/Ctrl+↑",
+        ),
+        Binding("H,shift+h", "app.show_help", "Help", key_display="Shift+H"),
+    ]
 
     class RemoveRequested(Message):
         def __init__(self, index: int) -> None:
@@ -259,22 +301,26 @@ class HelpScreen(ModalScreen[None]):
 
     BINDINGS = [
         Binding("escape", "close_help", "Close", show=False),
-        Binding("shift+h", "close_help", "Close", show=False),
+        Binding("H,shift+h", "close_help", "Close", show=False),
     ]
 
     HELP_TEXT = """[b]Filesystem[/b]
   j/k or arrows     move in the middle pane
   l/right/Enter     enter an ordinary directory
   h/left/Backspace  return to the parent
+  g/G               jump to first/last entry
   .                 toggle hidden entries
   r                 reload
 
 [b].d datasets[/b]
   Space             add highlighted .d folder to :selected:
-  Enter             jump from an already-selected .d to :selected:
+                    then move to the next filesystem row
+  Ctrl+Down         move focus to :selected:
+  Ctrl+Up           return focus to the filesystem pane
   Click             focus a row in :selected:
   j/k or arrows     move through selected paths
-  Space             mark the current path as HELA CHOSEN
+  g/G               jump to first/last selected path
+  Space             choose the current path as HeLa
   x or click ×      remove the current path
   h                 return focus to the middle pane
 
@@ -377,18 +423,20 @@ class FileViewerApp(App[None]):
     BINDINGS = [
         Binding("j", "cursor_down", "Down", show=False),
         Binding("k", "cursor_up", "Up", show=False),
-        Binding("space", "select_dataset", "Select .d"),
-        Binding("x", "remove_selected", "Remove"),
-        Binding("shift+h", "show_help", "Help"),
-        Binding("l", "open_selected", "Open"),
+        Binding("space", "select_dataset", "Select .d", show=False),
+        Binding("x", "remove_selected", "Remove", show=False),
+        Binding("H,shift+h", "show_help", "Help", show=False),
+        Binding("ctrl+down", "focus_selected_pane", "Pane down", show=False),
+        Binding("ctrl+up", "focus_current_pane", "Pane up", show=False),
+        Binding("l", "open_selected", "Open", show=False),
         Binding("right", "open_selected", "Open", show=False),
-        Binding("h", "go_parent", "Parent"),
+        Binding("h", "go_parent", "Parent", show=False),
         Binding("left", "go_parent", "Parent", show=False),
         Binding("backspace", "go_parent", "Parent", show=False),
         Binding("g", "first", "First", show=False),
-        Binding("shift+g", "last", "Last", show=False),
-        Binding(".", "toggle_hidden", "Hidden"),
-        Binding("r", "reload", "Reload"),
+        Binding("G,shift+g", "last", "Last", show=False),
+        Binding(".", "toggle_hidden", "Hidden", show=False),
+        Binding("r", "reload", "Reload", show=False),
         Binding("q", "quit", "Quit"),
     ]
 
@@ -404,11 +452,11 @@ class FileViewerApp(App[None]):
         yield Static(id="path-bar")
         with Horizontal(id="panes"):
             yield Static(id="parent-pane", classes="pane")
-            yield OptionList(id="current-pane", classes="pane", markup=False, compact=True)
+            yield CurrentOptionList(id="current-pane", classes="pane", markup=False, compact=True)
             yield Static(id="preview-pane", classes="pane")
         yield SelectedOptionList(id="selected-pane", classes="pane", markup=False, compact=True)
         yield Static(id="status-bar")
-        yield Footer()
+        yield Footer(compact=True)
 
     def on_mount(self) -> None:
         self.query_one("#parent-pane").border_title = "parent"
@@ -427,17 +475,8 @@ class FileViewerApp(App[None]):
             self._update_selected_status(event.option_index)
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
-        if event.option_list.id != "current-pane":
-            return
-        entry = self._selected_entry()
-        if (
-            entry is not None
-            and self._is_dataset(entry)
-            and entry.path in self.selected_paths
-        ):
-            self._focus_selected(entry.path)
-            return
-        self.action_open_selected()
+        if event.option_list.id == "current-pane":
+            self.action_open_selected()
 
     def on_selected_option_list_remove_requested(
         self, event: SelectedOptionList.RemoveRequested
@@ -507,6 +546,8 @@ class FileViewerApp(App[None]):
             self.notify(f"Selected {path}")
         else:
             self.notify(f"Already selected {path}")
+        self._refresh_current_marks()
+        self.query_one("#current-pane", CurrentOptionList).action_cursor_down()
 
     def action_remove_selected(self) -> None:
         selected = self.query_one("#selected-pane", SelectedOptionList)
@@ -517,6 +558,13 @@ class FileViewerApp(App[None]):
     def action_show_help(self) -> None:
         self.push_screen(HelpScreen())
 
+    def action_focus_selected_pane(self) -> None:
+        self._focus_selected()
+
+    def action_focus_current_pane(self) -> None:
+        current = self.query_one("#current-pane", CurrentOptionList)
+        current.focus()
+        self._update_selection(current.highlighted)
 
     def action_reload(self) -> None:
         selected = self._selected_entry()
@@ -554,6 +602,14 @@ class FileViewerApp(App[None]):
         selected.highlighted = min(highlighted or 0, len(self.selected_paths) - 1)
         selected.scroll_to_highlight()
 
+    def _refresh_current_marks(self) -> None:
+        current = self.query_one("#current-pane", CurrentOptionList)
+        for index, entry in enumerate(self.entries):
+            current.replace_option_prompt_at_index(
+                index,
+                _entry_label(entry, marked=entry.path in self.selected_paths),
+            )
+
     def _focus_selected(self, path: Path | None = None) -> None:
         if not self.selected_paths:
             self.notify("No .d folders selected", severity="warning")
@@ -575,6 +631,7 @@ class FileViewerApp(App[None]):
             self.chosen_path = None
         next_index = min(index, len(self.selected_paths) - 1) if self.selected_paths else None
         self._refresh_selected_pane(highlighted=next_index)
+        self._refresh_current_marks()
         self.query_one("#selected-pane", SelectedOptionList).focus()
         self.notify(f"Removed {removed}")
 
@@ -591,11 +648,10 @@ class FileViewerApp(App[None]):
     def _update_selected_status(self, index: int | None) -> None:
         status = self.query_one("#status-bar", Static)
         if index is None or not self.selected_paths:
-            status.update("0 selected .d folders · Space adds datasets")
+            status.update("0 selected .d folders")
             return
         status.update(
-            f"{index + 1}/{len(self.selected_paths)} selected .d folders · "
-            "Space choose · x remove · h return"
+            f"{index + 1}/{len(self.selected_paths)} selected .d folders"
         )
 
     @staticmethod
@@ -616,7 +672,12 @@ class FileViewerApp(App[None]):
 
         self.entries = listing.entries
         option_list = self.query_one("#current-pane", OptionList)
-        option_list.set_options([_entry_label(entry) for entry in self.entries])
+        option_list.set_options(
+            [
+                _entry_label(entry, marked=entry.path in self.selected_paths)
+                for entry in self.entries
+            ]
+        )
 
         highlighted = 0 if self.entries else None
         if highlight_name is not None:

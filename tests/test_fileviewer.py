@@ -131,26 +131,78 @@ def test_dot_d_selection_focus_choose_and_remove(tmp_path: Path) -> None:
             current = app.query_one("#current-pane", OptionList)
             selected = app.query_one("#selected-pane", OptionList)
 
+            def shown_descriptions() -> set[str]:
+                return {
+                    binding.description
+                    for _, binding, _, _ in app.active_bindings.values()
+                    if binding.show
+                }
+
+            assert {
+                "Down",
+                "Up",
+                "Select .d",
+                "Open",
+                "Parent",
+                "First",
+                "Last",
+                "Lower pane",
+                "Hidden",
+                "Reload",
+                "Help",
+                "Quit",
+            } <= shown_descriptions()
+            assert "Choose HeLa" not in shown_descriptions()
+            assert "Remove" not in shown_descriptions()
+
             await pilot.press("space")
             assert app.selected_paths == [dataset_a.resolve()]
             assert selected.option_count == 1
             assert app.focused is current
+            assert current.highlighted == 1
+            assert str(current.get_option_at_index(0).prompt).startswith("✓ ")
 
-            await pilot.press("j", "space")
+            await pilot.press("space")
             assert app.selected_paths == [dataset_a.resolve(), dataset_b.resolve()]
             assert selected.option_count == 2
+            assert current.highlighted == 2
+            assert str(current.get_option_at_index(1).prompt).startswith("✓ ")
 
-            await pilot.press("enter")
+            await pilot.press("ctrl+down")
+            await pilot.pause()
             assert app.focused is selected
             assert selected.highlighted == 1
+            assert {
+                "Down",
+                "Up",
+                "Choose HeLa",
+                "Remove",
+                "First",
+                "Last",
+                "Upper pane",
+                "Help",
+                "Quit",
+            } <= shown_descriptions()
+            assert "Select .d" not in shown_descriptions()
+            assert "Open" not in shown_descriptions()
 
-            await pilot.press("k", "space")
+            await pilot.press("H")
+            assert isinstance(app.screen, HelpScreen)
+            await pilot.press("escape")
+            await pilot.pause()
+            assert not isinstance(app.screen, HelpScreen)
+
+            await pilot.press("ctrl+up")
+            assert app.focused is current
+            await pilot.press("ctrl+down", "k", "space")
             assert selected.highlighted == 0
             assert app.chosen_path == dataset_a.resolve()
 
             await pilot.press("x")
             assert app.selected_paths == [dataset_b.resolve()]
             assert app.chosen_path is None
+            assert str(current.get_option_at_index(0).prompt).startswith("▸ ")
+            assert str(current.get_option_at_index(1).prompt).startswith("✓ ")
 
             await pilot.click("#selected-pane", offset=(2, 1))
             await pilot.pause()

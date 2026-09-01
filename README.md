@@ -33,21 +33,23 @@ trusted VPN first.
 
 The directory argument is optional for both commands and defaults to the process current working directory.
 
+The status row reports state only. All primary commands are shown in the compact, styled footer, which changes when focus moves between the filesystem and `:selected:` panes.
+
 ## Keys
 
 | Key | Action |
 | --- | --- |
 | `j` / `k`, arrows | Move selection |
 | `l`, right arrow, Enter | Enter an ordinary directory |
-| Space in middle pane | Add the highlighted `.d` directory to `:selected:` |
-| Enter on a selected `.d` | Focus its row in `:selected:` |
+| Space in middle pane | Add and mark the highlighted `.d`, then move down |
+| `Ctrl+Down` / `Ctrl+Up` | Move focus between filesystem and `:selected:` |
 | Space in `:selected:` | Mark the path and show `:HELA CHOSEN:` |
 | `x` or click `×` | Remove a path from `:selected:` |
 | `h`, left arrow, Backspace | Return to parent |
 | `g` / `G` | First / last entry |
 | `.` | Toggle hidden entries |
 | `r` | Refresh current directory |
-| Shift+H or Help | Open the usage popup |
+| Shift+H or Help | Open the overall usage popup |
 | `q` | Quit the session |
 
 Navigation is confined to the root passed on the command line. Symlinks are
