@@ -92,6 +92,10 @@ def test_app_moves_into_directory_and_back(tmp_path: Path) -> None:
             option_list = app.query_one("#current-pane", OptionList)
             assert option_list.highlighted == 0
             assert app.entries[0].name == "alpha"
+            await pilot.click("#parent-pane")
+            assert app.focused is option_list
+            await pilot.click("#preview-pane")
+            assert app.focused is option_list
 
             await pilot.press("l")
             await pilot.pause()

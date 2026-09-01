@@ -13,7 +13,7 @@ from typing import Iterable, Sequence
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, VerticalScroll
+from textual.containers import Horizontal
 from textual.widgets import Footer, Header, OptionList, Static
 
 
@@ -278,11 +278,9 @@ class FileViewerApp(App[None]):
         yield Header(show_clock=True)
         yield Static(id="path-bar")
         with Horizontal(id="panes"):
-            with VerticalScroll(id="parent-pane", classes="pane"):
-                yield Static(id="parent-content")
+            yield Static(id="parent-pane", classes="pane")
             yield OptionList(id="current-pane", classes="pane", markup=False, compact=True)
-            with VerticalScroll(id="preview-pane", classes="pane"):
-                yield Static(id="preview-content")
+            yield Static(id="preview-pane", classes="pane")
         yield Static(id="status-bar")
         yield Footer()
 
@@ -381,7 +379,7 @@ class FileViewerApp(App[None]):
         self._update_selection(highlighted)
 
     def _update_parent_pane(self) -> None:
-        content = self.query_one("#parent-content", Static)
+        content = self.query_one("#parent-pane", Static)
         if self.navigator.current == self.navigator.root:
             root_text = Text()
             root_text.append("configured root\n", style="bold cyan")
@@ -404,7 +402,7 @@ class FileViewerApp(App[None]):
         )
 
     def _update_selection(self, index: int | None) -> None:
-        preview = self.query_one("#preview-content", Static)
+        preview = self.query_one("#preview-pane", Static)
         status = self.query_one("#status-bar", Static)
 
         if index is None or not 0 <= index < len(self.entries):
