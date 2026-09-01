@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tickytickerwebui"
+version = "0.1.0"
+description = "A read-only, ranger-style filesystem navigator for the terminal and web"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "textual>=6,<9",
+    "textual-serve>=1.1.3,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<9",
+]
+
+[project.scripts]
+tickytickerwebui = "tickytickerwebui.app:main"
+tickytickerwebui-web = "tickytickerwebui.web:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
