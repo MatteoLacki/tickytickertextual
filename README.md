@@ -38,11 +38,16 @@ The directory argument is optional for both commands and defaults to the process
 | Key | Action |
 | --- | --- |
 | `j` / `k`, arrows | Move selection |
-| `l`, right arrow, Enter | Enter selected directory |
+| `l`, right arrow, Enter | Enter an ordinary directory |
+| Space in middle pane | Add the highlighted `.d` directory to `:selected:` |
+| Enter on a selected `.d` | Focus its row in `:selected:` |
+| Space in `:selected:` | Mark the path and show `:HELA CHOSEN:` |
+| `x` or click `×` | Remove a path from `:selected:` |
 | `h`, left arrow, Backspace | Return to parent |
 | `g` / `G` | First / last entry |
 | `.` | Toggle hidden entries |
 | `r` | Refresh current directory |
+| Shift+H or Help | Open the usage popup |
 | `q` | Quit the session |
 
 Navigation is confined to the root passed on the command line. Symlinks are

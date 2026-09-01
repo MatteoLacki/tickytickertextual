@@ -9,6 +9,7 @@ from textual.widgets import OptionList
 
 from tickytickertextual.app import (
     FileSystemNavigator,
+    HelpScreen,
     FileViewerApp,
     NavigationError,
     format_size,
@@ -94,6 +95,12 @@ def test_app_moves_into_directory_and_back(tmp_path: Path) -> None:
             assert app.entries[0].name == "alpha"
             await pilot.click("#parent-pane")
             assert app.focused is option_list
+
+            await pilot.press("shift+h")
+            assert isinstance(app.screen, HelpScreen)
+            await pilot.click("#help-close")
+            await pilot.pause()
+            assert not isinstance(app.screen, HelpScreen)
             await pilot.click("#preview-pane")
             assert app.focused is option_list
 
@@ -109,3 +116,44 @@ def test_app_moves_into_directory_and_back(tmp_path: Path) -> None:
 
     asyncio.run(exercise())
 
+
+
+def test_dot_d_selection_focus_choose_and_remove(tmp_path: Path) -> None:
+    dataset_a = tmp_path / "alpha.d"
+    dataset_a.mkdir()
+    dataset_b = tmp_path / "beta.d"
+    dataset_b.mkdir()
+    (tmp_path / "ordinary").mkdir()
+
+    async def exercise() -> None:
+        app = FileViewerApp(tmp_path)
+        async with app.run_test(size=(110, 36)) as pilot:
+            current = app.query_one("#current-pane", OptionList)
+            selected = app.query_one("#selected-pane", OptionList)
+
+            await pilot.press("space")
+            assert app.selected_paths == [dataset_a.resolve()]
+            assert selected.option_count == 1
+            assert app.focused is current
+
+            await pilot.press("j", "space")
+            assert app.selected_paths == [dataset_a.resolve(), dataset_b.resolve()]
+            assert selected.option_count == 2
+
+            await pilot.press("enter")
+            assert app.focused is selected
+            assert selected.highlighted == 1
+
+            await pilot.press("k", "space")
+            assert selected.highlighted == 0
+            assert app.chosen_path == dataset_a.resolve()
+
+            await pilot.press("x")
+            assert app.selected_paths == [dataset_b.resolve()]
+            assert app.chosen_path is None
+
+            await pilot.click("#selected-pane", offset=(2, 1))
+            await pilot.pause()
+            assert app.selected_paths == []
+
+    asyncio.run(exercise())

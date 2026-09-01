@@ -14,6 +14,7 @@
 - Confine navigation to the configured root and never follow symlinks.
 - Keep the navigator read-only. Files show metadata only; file contents and filesystem images are not previewed.
 - The optional CLI directory defaults to the process current working directory.
+- `.d` directories can be collected in the interactive `:selected:` pane; one path may be marked as `:HELA CHOSEN:`, and removal must not touch the filesystem.
 
 ## Development
 

@@ -10,11 +10,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from rich.style import Style
 from rich.text import Text
+from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal
-from textual.widgets import Footer, Header, OptionList, Static
+from textual.containers import Container, Horizontal
+from textual.message import Message
+from textual.screen import ModalScreen
+from textual.widgets import Button, Footer, Header, OptionList, Static
 
 
 class NavigationError(Exception):
@@ -181,6 +185,116 @@ def _listing_text(
     return output
 
 
+class SelectedOptionList(OptionList):
+    """Option list with a clickable remove control on each row."""
+
+    class RemoveRequested(Message):
+        def __init__(self, index: int) -> None:
+            super().__init__()
+            self.index = index
+
+    async def _on_click(self, event: events.Click) -> None:
+        remove_index = event.style.meta.get("remove-selected")
+        if isinstance(remove_index, int):
+            self.highlighted = remove_index
+            event.stop()
+            self.post_message(self.RemoveRequested(remove_index))
+            return
+        await super()._on_click(event)
+
+
+def _selected_path_label(path: Path, index: int, *, chosen: bool) -> Text:
+    label = Text(no_wrap=True, overflow="ellipsis")
+    label.append(
+        " × ",
+        style=Style(
+            color="#ff7b72",
+            bold=True,
+            meta={"remove-selected": index},
+        ),
+    )
+    label.append("★ " if chosen else "  ", style="bold yellow" if chosen else "dim")
+    label.append(str(path), style="bold yellow" if chosen else "#c9d1d9")
+    if chosen:
+        label.stylize("on #3d3200")
+    return label
+
+
+class HelpScreen(ModalScreen[None]):
+    """Basic keyboard and mouse usage."""
+
+    CSS = """
+    HelpScreen {
+        align: center middle;
+        background: #000000 70%;
+    }
+
+    #help-dialog {
+        width: 76;
+        max-width: 95%;
+        height: 28;
+        max-height: 95%;
+        padding: 1 2;
+        border: round #58a6ff;
+        background: #161b22;
+    }
+
+    #help-title {
+        height: 2;
+        text-align: center;
+        text-style: bold;
+        color: #8be9fd;
+    }
+
+    #help-content {
+        height: 1fr;
+    }
+
+    #help-close {
+        width: 16;
+        height: 3;
+        dock: bottom;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "close_help", "Close", show=False),
+        Binding("shift+h", "close_help", "Close", show=False),
+    ]
+
+    HELP_TEXT = """[b]Filesystem[/b]
+  j/k or arrows     move in the middle pane
+  l/right/Enter     enter an ordinary directory
+  h/left/Backspace  return to the parent
+  .                 toggle hidden entries
+  r                 reload
+
+[b].d datasets[/b]
+  Space             add highlighted .d folder to :selected:
+  Enter             jump from an already-selected .d to :selected:
+  Click             focus a row in :selected:
+  j/k or arrows     move through selected paths
+  Space             mark the current path as HELA CHOSEN
+  x or click ×      remove the current path
+  h                 return focus to the middle pane
+
+Shift+H opens this help. Escape or Close dismisses it. q quits."""
+
+    def compose(self) -> ComposeResult:
+        with Container(id="help-dialog"):
+            yield Static("tickytickertextual help", id="help-title")
+            yield Static(self.HELP_TEXT, id="help-content")
+            yield Button("Close", id="help-close", variant="primary")
+
+    def action_close_help(self) -> None:
+        self.dismiss()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "help-close":
+            self.dismiss()
+
+
+
 class FileViewerApp(App[None]):
     """Three-pane read-only filesystem navigator."""
 
@@ -208,7 +322,7 @@ class FileViewerApp(App[None]):
     }
 
     #panes {
-        height: 1fr;
+        height: 3fr;
     }
 
     .pane {
@@ -241,6 +355,12 @@ class FileViewerApp(App[None]):
         text-style: bold;
     }
 
+    #selected-pane {
+        height: 1fr;
+        min-height: 5;
+        padding: 0;
+    }
+
     #status-bar {
         height: 1;
         padding: 0 1;
@@ -257,6 +377,9 @@ class FileViewerApp(App[None]):
     BINDINGS = [
         Binding("j", "cursor_down", "Down", show=False),
         Binding("k", "cursor_up", "Up", show=False),
+        Binding("space", "select_dataset", "Select .d"),
+        Binding("x", "remove_selected", "Remove"),
+        Binding("shift+h", "show_help", "Help"),
         Binding("l", "open_selected", "Open"),
         Binding("right", "open_selected", "Open", show=False),
         Binding("h", "go_parent", "Parent"),
@@ -273,6 +396,8 @@ class FileViewerApp(App[None]):
         super().__init__()
         self.navigator = FileSystemNavigator(root, show_hidden=show_hidden)
         self.entries: tuple[FileEntry, ...] = ()
+        self.selected_paths: list[Path] = []
+        self.chosen_path: Path | None = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -281,6 +406,7 @@ class FileViewerApp(App[None]):
             yield Static(id="parent-pane", classes="pane")
             yield OptionList(id="current-pane", classes="pane", markup=False, compact=True)
             yield Static(id="preview-pane", classes="pane")
+        yield SelectedOptionList(id="selected-pane", classes="pane", markup=False, compact=True)
         yield Static(id="status-bar")
         yield Footer()
 
@@ -288,6 +414,7 @@ class FileViewerApp(App[None]):
         self.query_one("#parent-pane").border_title = "parent"
         self.query_one("#current-pane").border_title = "current"
         self.query_one("#preview-pane").border_title = "selection"
+        self.query_one("#selected-pane").border_title = ":selected:"
         self._open_directory(self.navigator.root)
         self.query_one("#current-pane", OptionList).focus()
 
@@ -296,24 +423,48 @@ class FileViewerApp(App[None]):
     ) -> None:
         if event.option_list.id == "current-pane":
             self._update_selection(event.option_index)
+        elif event.option_list.id == "selected-pane":
+            self._update_selected_status(event.option_index)
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
-        if event.option_list.id == "current-pane":
-            self.action_open_selected()
+        if event.option_list.id != "current-pane":
+            return
+        entry = self._selected_entry()
+        if (
+            entry is not None
+            and self._is_dataset(entry)
+            and entry.path in self.selected_paths
+        ):
+            self._focus_selected(entry.path)
+            return
+        self.action_open_selected()
+
+    def on_selected_option_list_remove_requested(
+        self, event: SelectedOptionList.RemoveRequested
+    ) -> None:
+        self._remove_selected_at(event.index)
+
+    def _focused_option_list(self) -> OptionList:
+        selected = self.query_one("#selected-pane", SelectedOptionList)
+        if selected.has_focus:
+            return selected
+        return self.query_one("#current-pane", OptionList)
 
     def action_cursor_down(self) -> None:
-        self.query_one("#current-pane", OptionList).action_cursor_down()
+        self._focused_option_list().action_cursor_down()
 
     def action_cursor_up(self) -> None:
-        self.query_one("#current-pane", OptionList).action_cursor_up()
+        self._focused_option_list().action_cursor_up()
 
     def action_first(self) -> None:
-        self.query_one("#current-pane", OptionList).action_first()
+        self._focused_option_list().action_first()
 
     def action_last(self) -> None:
-        self.query_one("#current-pane", OptionList).action_last()
+        self._focused_option_list().action_last()
 
     def action_open_selected(self) -> None:
+        if self.query_one("#selected-pane", SelectedOptionList).has_focus:
+            return
         entry = self._selected_entry()
         if entry is None:
             return
@@ -326,11 +477,46 @@ class FileViewerApp(App[None]):
         self._open_directory(entry.path)
 
     def action_go_parent(self) -> None:
+        selected = self.query_one("#selected-pane", SelectedOptionList)
+        if selected.has_focus:
+            self.query_one("#current-pane", OptionList).focus()
+            self._update_selection(
+                self.query_one("#current-pane", OptionList).highlighted
+            )
+            return
         if self.navigator.current == self.navigator.root:
             self.notify("Already at the configured root")
             return
         previous_name = self.navigator.current.name
         self._open_directory(self.navigator.parent(), highlight_name=previous_name)
+
+    def action_select_dataset(self) -> None:
+        selected = self.query_one("#selected-pane", SelectedOptionList)
+        if selected.has_focus:
+            self._choose_selected_path()
+            return
+
+        entry = self._selected_entry()
+        if entry is None or not self._is_dataset(entry):
+            self.notify("Space selects .d directories only", severity="warning")
+            return
+        path = entry.path
+        if path not in self.selected_paths:
+            self.selected_paths.append(path)
+            self._refresh_selected_pane(highlighted=len(self.selected_paths) - 1)
+            self.notify(f"Selected {path}")
+        else:
+            self.notify(f"Already selected {path}")
+
+    def action_remove_selected(self) -> None:
+        selected = self.query_one("#selected-pane", SelectedOptionList)
+        if not selected.has_focus or selected.highlighted is None:
+            return
+        self._remove_selected_at(selected.highlighted)
+
+    def action_show_help(self) -> None:
+        self.push_screen(HelpScreen())
+
 
     def action_reload(self) -> None:
         selected = self._selected_entry()
@@ -348,6 +534,78 @@ class FileViewerApp(App[None]):
         )
         state = "shown" if self.navigator.show_hidden else "hidden"
         self.notify(f"Hidden entries are {state}")
+
+    def _refresh_selected_pane(self, *, highlighted: int | None = None) -> None:
+        selected = self.query_one("#selected-pane", SelectedOptionList)
+        if highlighted is None:
+            highlighted = selected.highlighted
+        selected.set_options(
+            [
+                _selected_path_label(
+                    path, index, chosen=path == self.chosen_path
+                )
+                for index, path in enumerate(self.selected_paths)
+            ]
+        )
+        if not self.selected_paths:
+            selected.highlighted = None
+            self._update_selected_status(None)
+            return
+        selected.highlighted = min(highlighted or 0, len(self.selected_paths) - 1)
+        selected.scroll_to_highlight()
+
+    def _focus_selected(self, path: Path | None = None) -> None:
+        if not self.selected_paths:
+            self.notify("No .d folders selected", severity="warning")
+            return
+        selected = self.query_one("#selected-pane", SelectedOptionList)
+        selected.focus()
+        if path in self.selected_paths:
+            selected.highlighted = self.selected_paths.index(path)
+        elif selected.highlighted is None:
+            selected.highlighted = 0
+        selected.scroll_to_highlight()
+        self._update_selected_status(selected.highlighted)
+
+    def _remove_selected_at(self, index: int) -> None:
+        if not 0 <= index < len(self.selected_paths):
+            return
+        removed = self.selected_paths.pop(index)
+        if self.chosen_path == removed:
+            self.chosen_path = None
+        next_index = min(index, len(self.selected_paths) - 1) if self.selected_paths else None
+        self._refresh_selected_pane(highlighted=next_index)
+        self.query_one("#selected-pane", SelectedOptionList).focus()
+        self.notify(f"Removed {removed}")
+
+    def _choose_selected_path(self) -> None:
+        selected = self.query_one("#selected-pane", SelectedOptionList)
+        index = selected.highlighted
+        if index is None or not 0 <= index < len(self.selected_paths):
+            return
+        self.chosen_path = self.selected_paths[index]
+        self._refresh_selected_pane(highlighted=index)
+        selected.focus()
+        self.notify(":HELA CHOSEN:")
+
+    def _update_selected_status(self, index: int | None) -> None:
+        status = self.query_one("#status-bar", Static)
+        if index is None or not self.selected_paths:
+            status.update("0 selected .d folders · Space adds datasets")
+            return
+        status.update(
+            f"{index + 1}/{len(self.selected_paths)} selected .d folders · "
+            "Space choose · x remove · h return"
+        )
+
+    @staticmethod
+    def _is_dataset(entry: FileEntry) -> bool:
+        return (
+            entry.is_dir
+            and not entry.is_symlink
+            and entry.name.casefold().endswith(".d")
+        )
+
 
     def _open_directory(self, path: Path, *, highlight_name: str | None = None) -> None:
         try:
