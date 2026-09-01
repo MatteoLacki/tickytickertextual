@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import os
 import stat
+import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -18,7 +20,7 @@ from textual.binding import Binding
 from textual.containers import Container, Horizontal
 from textual.message import Message
 from textual.screen import ModalScreen
-from textual.widgets import Button, Footer, Header, OptionList, Static
+from textual.widgets import Button, Footer, Header, Input, OptionList, Static
 
 
 class NavigationError(Exception):
@@ -67,6 +69,7 @@ class FileSystemNavigator:
         path: str | os.PathLike[str],
         *,
         limit: int | None = None,
+        directories_only: bool = False,
     ) -> DirectoryListing:
         """Read one directory without recursion or persistent caching."""
         directory = self._checked_directory(path)
@@ -78,19 +81,39 @@ class FileSystemNavigator:
                 for raw_entry in iterator:
                     if not self.show_hidden and raw_entry.name.startswith("."):
                         continue
+                    entry = self._make_entry(raw_entry)
+                    if directories_only and not entry.is_dir:
+                        continue
                     if limit is not None and len(entries) >= limit:
                         truncated = True
                         break
-                    entries.append(self._make_entry(raw_entry))
+                    entries.append(entry)
         except OSError as error:
             raise NavigationError(f"Cannot read {directory}: {error}") from error
 
-        entries.sort(key=lambda entry: (not entry.is_dir, entry.name.casefold(), entry.name))
+        entries.sort(
+            key=lambda entry: (
+                (
+                    0
+                    if entry.is_dir and not entry.name.casefold().endswith(".d")
+                    else 1
+                    if entry.is_dir
+                    else 2
+                ),
+                entry.name.casefold(),
+                entry.name,
+            )
+        )
         return DirectoryListing(directory, tuple(entries), truncated)
 
-    def change_directory(self, path: str | os.PathLike[str]) -> DirectoryListing:
+    def change_directory(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        directories_only: bool = False,
+    ) -> DirectoryListing:
         """Validate and enter a directory, returning its fresh listing."""
-        listing = self.scan(path)
+        listing = self.scan(path, directories_only=directories_only)
         self.current = listing.path
         return listing
 
@@ -151,6 +174,46 @@ def format_size(size: int | None) -> str:
     return f"{value:.1f} PiB"
 
 
+def _read_dataset_description(
+    dataset_path: Path,
+) -> tuple[str | None, str | None]:
+    """Return a Description and a diagnostic without modifying analysis.tdf."""
+    database = dataset_path / "analysis.tdf"
+    if not database.is_file():
+        return None, "analysis.tdf not found"
+    try:
+        uri = f"{database.resolve(strict=True).as_uri()}?mode=ro"
+        with sqlite3.connect(uri, uri=True, timeout=1.0) as connection:
+            row = connection.execute(
+                "SELECT \"Value\" FROM \"GlobalMetadata\" "
+                "WHERE \"Key\" = ? LIMIT 1",
+                ("Description",),
+            ).fetchone()
+    except OSError as error:
+        return None, f"filesystem error: {error}"
+    except sqlite3.Error as error:
+        return None, f"SQLite error: {error}"
+    if row is None or row[0] is None:
+        return None, "GlobalMetadata.Description not found"
+    description = str(row[0]).strip()
+    if not description:
+        return None, "GlobalMetadata.Description is empty"
+    return description, None
+
+
+def read_dataset_description(dataset_path: Path) -> str | None:
+    """Read a dataset Description from analysis.tdf without modifying it."""
+    description, _ = _read_dataset_description(dataset_path)
+    return description
+
+
+def _matches_name_filter(name: str, pattern: str | None) -> bool:
+    """Match a name against a case-insensitive shell-style glob."""
+    if not pattern:
+        return True
+    return fnmatch.fnmatchcase(name.casefold(), pattern.casefold())
+
+
 def _entry_label(entry: FileEntry, *, marked: bool = False) -> Text:
     label = Text(no_wrap=True, overflow="ellipsis")
     if entry.is_dir:
@@ -206,6 +269,13 @@ class CurrentOptionList(OptionList):
             key_display="Ctrl+↓",
         ),
         Binding(".", "app.toggle_hidden", "Hidden"),
+        Binding(
+            "ctrl+full_stop,ctrl+.",
+            "app.toggle_folders_only",
+            "Folders only",
+            key_display="Ctrl+.",
+        ),
+        Binding("/", "app.show_filter", "Filter"),
         Binding("r", "app.reload", "Reload"),
         Binding("H,shift+h", "app.show_help", "Help", key_display="Shift+H"),
     ]
@@ -217,7 +287,7 @@ class SelectedOptionList(OptionList):
     BINDINGS = [
         Binding("j,down", "app.cursor_down", "Down", key_display="j/↓"),
         Binding("k,up", "app.cursor_up", "Up", key_display="k/↑"),
-        Binding("space", "app.select_dataset", "Choose HeLa"),
+        Binding("space", "app.select_dataset", "Toggle HeLa"),
         Binding("x", "app.remove_selected", "Remove"),
         Binding("g", "app.first", "First"),
         Binding("G,shift+g", "app.last", "Last", key_display="G"),
@@ -226,6 +296,12 @@ class SelectedOptionList(OptionList):
             "app.focus_current_pane",
             "Upper pane",
             key_display="h/Ctrl+↑",
+        ),
+        Binding(
+            "ctrl+full_stop,ctrl+.",
+            "app.toggle_folders_only",
+            "Folders only",
+            key_display="Ctrl+.",
         ),
         Binding("H,shift+h", "app.show_help", "Help", key_display="Shift+H"),
     ]
@@ -245,7 +321,14 @@ class SelectedOptionList(OptionList):
         await super()._on_click(event)
 
 
-def _selected_path_label(path: Path, index: int, *, chosen: bool) -> Text:
+def _selected_path_label(
+    path: Path,
+    index: int,
+    *,
+    chosen: bool,
+    description: str | None,
+    description_error: str | None,
+) -> Text:
     label = Text(no_wrap=True, overflow="ellipsis")
     label.append(
         " × ",
@@ -257,9 +340,98 @@ def _selected_path_label(path: Path, index: int, *, chosen: bool) -> Text:
     )
     label.append("★ " if chosen else "  ", style="bold yellow" if chosen else "dim")
     label.append(str(path), style="bold yellow" if chosen else "#c9d1d9")
+    label.append("\n      ")
+    label.append("Description: ", style="dim italic")
+    label.append(
+        description or f"unavailable ({description_error or 'unknown error'})",
+        style="bold yellow" if chosen else "italic #8b949e",
+    )
     if chosen:
         label.stylize("on #3d3200")
     return label
+
+
+class FilterScreen(ModalScreen[str | None]):
+    """Prompt for a non-recursive current-directory glob filter."""
+
+    CSS = """
+    FilterScreen {
+        align: center middle;
+        background: #000000 70%;
+    }
+
+    #filter-dialog {
+        width: 72;
+        max-width: 95%;
+        height: 12;
+        padding: 1 2;
+        border: round #58a6ff;
+        background: #161b22;
+    }
+
+    #filter-title {
+        height: 2;
+        text-align: center;
+        text-style: bold;
+        color: #8be9fd;
+    }
+
+    #filter-input {
+        margin: 1 0;
+    }
+
+    #filter-hint {
+        height: 1;
+        color: #8b949e;
+    }
+
+    #filter-buttons {
+        height: 3;
+        align-horizontal: right;
+    }
+
+    #filter-buttons Button {
+        width: 12;
+        margin-left: 1;
+    }
+    """
+
+    BINDINGS = [Binding("escape", "cancel_filter", "Cancel", show=False)]
+
+    def __init__(self, pattern: str | None) -> None:
+        super().__init__()
+        self.pattern = pattern or ""
+
+    def compose(self) -> ComposeResult:
+        with Container(id="filter-dialog"):
+            yield Static("Filter current directory", id="filter-title")
+            yield Input(
+                value=self.pattern,
+                placeholder="e.g. *_13214.d",
+                id="filter-input",
+            )
+            yield Static("Shell glob; empty input clears the filter", id="filter-hint")
+            with Horizontal(id="filter-buttons"):
+                yield Button("Clear", id="filter-clear")
+                yield Button("Cancel", id="filter-cancel")
+                yield Button("Apply", id="filter-apply", variant="primary")
+
+    def on_mount(self) -> None:
+        self.query_one("#filter-input", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value.strip())
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "filter-apply":
+            self.dismiss(self.query_one("#filter-input", Input).value.strip())
+        elif event.button.id == "filter-clear":
+            self.dismiss("")
+        elif event.button.id == "filter-cancel":
+            self.dismiss(None)
+
+    def action_cancel_filter(self) -> None:
+        self.dismiss(None)
 
 
 class HelpScreen(ModalScreen[None]):
@@ -274,7 +446,7 @@ class HelpScreen(ModalScreen[None]):
     #help-dialog {
         width: 76;
         max-width: 95%;
-        height: 28;
+        height: 32;
         max-height: 95%;
         padding: 1 2;
         border: round #58a6ff;
@@ -310,17 +482,21 @@ class HelpScreen(ModalScreen[None]):
   h/left/Backspace  return to the parent
   g/G               jump to first/last entry
   .                 toggle hidden entries
+  Ctrl+.            toggle folders-only mode (on initially)
+  /                 filter current names with a shell glob
+                    (empty input clears the filter)
   r                 reload
 
 [b].d datasets[/b]
-  Space             add highlighted .d folder to :selected:
-                    then move to the next filesystem row
+  Preview           shows all contents even in folders-only mode
+  Space             add highlighted .d folder to :selected:, read its
+                    analysis.tdf Description, then move down
   Ctrl+Down         move focus to :selected:
   Ctrl+Up           return focus to the filesystem pane
   Click             focus a row in :selected:
   j/k or arrows     move through selected paths
   g/G               jump to first/last selected path
-  Space             choose the current path as HeLa
+  Space             toggle the current path as HeLa
   x or click ×      remove the current path
   h                 return focus to the middle pane
 
@@ -436,6 +612,13 @@ class FileViewerApp(App[None]):
         Binding("g", "first", "First", show=False),
         Binding("G,shift+g", "last", "Last", show=False),
         Binding(".", "toggle_hidden", "Hidden", show=False),
+        Binding(
+            "ctrl+full_stop,ctrl+.",
+            "toggle_folders_only",
+            "Folders only",
+            show=False,
+        ),
+        Binding("/", "show_filter", "Filter", show=False),
         Binding("r", "reload", "Reload", show=False),
         Binding("q", "quit", "Quit"),
     ]
@@ -444,7 +627,11 @@ class FileViewerApp(App[None]):
         super().__init__()
         self.navigator = FileSystemNavigator(root, show_hidden=show_hidden)
         self.entries: tuple[FileEntry, ...] = ()
+        self.folders_only = True
+        self.name_filter: str | None = None
         self.selected_paths: list[Path] = []
+        self.selected_descriptions: dict[Path, str | None] = {}
+        self.selected_description_errors: dict[Path, str | None] = {}
         self.chosen_path: Path | None = None
 
     def compose(self) -> ComposeResult:
@@ -464,7 +651,9 @@ class FileViewerApp(App[None]):
         self.query_one("#preview-pane").border_title = "selection"
         self.query_one("#selected-pane").border_title = ":selected:"
         self._open_directory(self.navigator.root)
-        self.query_one("#current-pane", OptionList).focus()
+        current = self.query_one("#current-pane", CurrentOptionList)
+        current.focus()
+        self.call_after_refresh(current.focus)
 
     def on_option_list_option_highlighted(
         self, event: OptionList.OptionHighlighted
@@ -532,7 +721,7 @@ class FileViewerApp(App[None]):
     def action_select_dataset(self) -> None:
         selected = self.query_one("#selected-pane", SelectedOptionList)
         if selected.has_focus:
-            self._choose_selected_path()
+            self._toggle_chosen_path()
             return
 
         entry = self._selected_entry()
@@ -541,13 +730,26 @@ class FileViewerApp(App[None]):
             return
         path = entry.path
         if path not in self.selected_paths:
+            description, description_error = _read_dataset_description(path)
+            self.selected_descriptions[path] = description
+            self.selected_description_errors[path] = description_error
             self.selected_paths.append(path)
             self._refresh_selected_pane(highlighted=len(self.selected_paths) - 1)
             self.notify(f"Selected {path}")
+            if description_error:
+                self.notify(
+                    f"Description unavailable: {description_error}",
+                    severity="warning",
+                )
         else:
             self.notify(f"Already selected {path}")
         self._refresh_current_marks()
-        self.query_one("#current-pane", CurrentOptionList).action_cursor_down()
+        current = self.query_one("#current-pane", CurrentOptionList)
+        if (
+            current.highlighted is not None
+            and current.highlighted < current.option_count - 1
+        ):
+            current.action_cursor_down()
 
     def action_remove_selected(self) -> None:
         selected = self.query_one("#selected-pane", SelectedOptionList)
@@ -583,6 +785,36 @@ class FileViewerApp(App[None]):
         state = "shown" if self.navigator.show_hidden else "hidden"
         self.notify(f"Hidden entries are {state}")
 
+    def action_toggle_folders_only(self) -> None:
+        current_entry = self._selected_entry()
+        selected_pane = self.query_one("#selected-pane", SelectedOptionList)
+        selected_focused = selected_pane.has_focus
+        self.folders_only = not self.folders_only
+        self._open_directory(
+            self.navigator.current,
+            highlight_name=(
+                current_entry.name if current_entry is not None else None
+            ),
+        )
+        if selected_focused:
+            selected_pane.focus()
+            self._update_selected_status(selected_pane.highlighted)
+        state = "on" if self.folders_only else "off"
+        self.notify(f"Folders-only mode is {state}")
+
+    def action_show_filter(self) -> None:
+        self.push_screen(FilterScreen(self.name_filter), self._apply_name_filter)
+
+    def _apply_name_filter(self, pattern: str | None) -> None:
+        if pattern is None:
+            return
+        self.name_filter = pattern or None
+        self.action_reload()
+        if self.name_filter:
+            self.notify(f"Name filter: {self.name_filter}")
+        else:
+            self.notify("Name filter cleared")
+
     def _refresh_selected_pane(self, *, highlighted: int | None = None) -> None:
         selected = self.query_one("#selected-pane", SelectedOptionList)
         if highlighted is None:
@@ -590,7 +822,11 @@ class FileViewerApp(App[None]):
         selected.set_options(
             [
                 _selected_path_label(
-                    path, index, chosen=path == self.chosen_path
+                    path,
+                    index,
+                    chosen=path == self.chosen_path,
+                    description=self.selected_descriptions.get(path),
+                    description_error=self.selected_description_errors.get(path),
                 )
                 for index, path in enumerate(self.selected_paths)
             ]
@@ -627,6 +863,8 @@ class FileViewerApp(App[None]):
         if not 0 <= index < len(self.selected_paths):
             return
         removed = self.selected_paths.pop(index)
+        self.selected_descriptions.pop(removed, None)
+        self.selected_description_errors.pop(removed, None)
         if self.chosen_path == removed:
             self.chosen_path = None
         next_index = min(index, len(self.selected_paths) - 1) if self.selected_paths else None
@@ -635,15 +873,21 @@ class FileViewerApp(App[None]):
         self.query_one("#selected-pane", SelectedOptionList).focus()
         self.notify(f"Removed {removed}")
 
-    def _choose_selected_path(self) -> None:
+    def _toggle_chosen_path(self) -> None:
         selected = self.query_one("#selected-pane", SelectedOptionList)
         index = selected.highlighted
         if index is None or not 0 <= index < len(self.selected_paths):
             return
-        self.chosen_path = self.selected_paths[index]
+        path = self.selected_paths[index]
+        if self.chosen_path == path:
+            self.chosen_path = None
+            message = ":HELA UNSELECTED:"
+        else:
+            self.chosen_path = path
+            message = ":HELA CHOSEN:"
         self._refresh_selected_pane(highlighted=index)
         selected.focus()
-        self.notify(":HELA CHOSEN:")
+        self.notify(message)
 
     def _update_selected_status(self, index: int | None) -> None:
         status = self.query_one("#status-bar", Static)
@@ -665,12 +909,18 @@ class FileViewerApp(App[None]):
 
     def _open_directory(self, path: Path, *, highlight_name: str | None = None) -> None:
         try:
-            listing = self.navigator.change_directory(path)
+            listing = self.navigator.change_directory(
+                path, directories_only=self.folders_only
+            )
         except NavigationError as error:
             self.notify(str(error), severity="error")
             return
 
-        self.entries = listing.entries
+        self.entries = tuple(
+            entry
+            for entry in listing.entries
+            if _matches_name_filter(entry.name, self.name_filter)
+        )
         option_list = self.query_one("#current-pane", OptionList)
         option_list.set_options(
             [
@@ -693,7 +943,11 @@ class FileViewerApp(App[None]):
         if highlighted is not None:
             option_list.scroll_to_highlight()
 
-        self.query_one("#path-bar", Static).update(str(listing.path))
+        mode = "folders only" if self.folders_only else "folders + files"
+        filter_status = f" · filter: {self.name_filter}" if self.name_filter else ""
+        self.query_one("#path-bar", Static).update(
+            f"{listing.path}  [{mode}{filter_status}]"
+        )
         self._update_parent_pane()
         self._update_selection(highlighted)
 
@@ -708,7 +962,11 @@ class FileViewerApp(App[None]):
             return
 
         try:
-            listing = self.navigator.scan(self.navigator.current.parent, limit=500)
+            listing = self.navigator.scan(
+                self.navigator.current.parent,
+                limit=500,
+                directories_only=self.folders_only,
+            )
         except NavigationError as error:
             content.update(Text(str(error), style="red"))
             return
@@ -732,7 +990,13 @@ class FileViewerApp(App[None]):
         entry = self.entries[index]
         if entry.is_dir:
             try:
-                listing = self.navigator.scan(entry.path, limit=500)
+                listing = self.navigator.scan(
+                    entry.path,
+                    limit=500,
+                    directories_only=(
+                        self.folders_only and not self._is_dataset(entry)
+                    ),
+                )
             except NavigationError as error:
                 preview.update(Text(str(error), style="red"))
             else:

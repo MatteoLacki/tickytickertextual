@@ -42,6 +42,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         port=args.port,
         title=f"tickytickertextual · {root}",
         public_url=args.public_url,
+        templates_path=Path(__file__).with_name("templates"),
     )
     server.serve()
 

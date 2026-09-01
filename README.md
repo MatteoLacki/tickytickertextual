@@ -1,11 +1,13 @@
 # tickytickertextual
 
 A small, read-only filesystem navigator with a ranger-like three-pane layout.
-Directories are read only when they are visited or selected; there is no file
-index, recursive scan, database, upload, rename, or delete operation.
+Directories are read only when they are visited or selected; there is no generated
+file index, recursive scan, application database, upload, rename, or delete operation.
 
-The right pane deliberately shows only child names or file metadata. It does
-not decode or preview filesystem images. Application-generated image views can
+Folder-only mode is enabled initially. Ordinary folders are listed before `.d`
+datasets, while files can be revealed with `Ctrl+.`. The right pane follows the
+same mode for ordinary folders but shows all contents when previewing a `.d`.
+It does not decode or preview filesystem images. Application-generated image views can
 be added later without coupling them to filesystem browsing.
 
 ## Install
@@ -41,13 +43,15 @@ The status row reports state only. All primary commands are shown in the compact
 | --- | --- |
 | `j` / `k`, arrows | Move selection |
 | `l`, right arrow, Enter | Enter an ordinary directory |
-| Space in middle pane | Add and mark the highlighted `.d`, then move down |
+| Space in middle pane | Add and mark a `.d`, read its `analysis.tdf` Description, then move down |
 | `Ctrl+Down` / `Ctrl+Up` | Move focus between filesystem and `:selected:` |
-| Space in `:selected:` | Mark the path and show `:HELA CHOSEN:` |
+| Space in `:selected:` | Toggle the highlighted path as HeLa |
 | `x` or click `×` | Remove a path from `:selected:` |
 | `h`, left arrow, Backspace | Return to parent |
 | `g` / `G` | First / last entry |
 | `.` | Toggle hidden entries |
+| `Ctrl+.` | Toggle folder-only mode (on initially) |
+| `/` | Filter current names with a shell glob; empty input clears it |
 | `r` | Refresh current directory |
 | Shift+H or Help | Open the overall usage popup |
 | `q` | Quit the session |
