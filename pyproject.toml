@@ -11,9 +11,14 @@ requires-python = ">=3.11"
 license = "MIT"
 license-files = ["LICENSE"]
 dependencies = [
+    "numpy>=2,<3",
+    "tickyticker>=0.1,<0.2",
     "textual>=6,<9",
     "textual-serve>=1.1.3,<2",
 ]
+
+[tool.uv.sources]
+tickyticker = { git = "https://github.com/MatteoLacki/tickyticker.git", rev = "c67651a3615e4fe513b19aeb13138046a731899f" }
 
 [project.optional-dependencies]
 dev = [
@@ -32,4 +37,3 @@ tickytickertextual = ["templates/*.html"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-

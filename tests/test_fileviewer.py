@@ -1,21 +1,37 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sqlite3
 from pathlib import Path
 
+import numpy as np
 import pytest
+from tickyticker import charge_regions
 from textual.widgets import Input, OptionList, Static
 
+from tickytickertextual import app as app_module
 from tickytickertextual import web
 from tickytickertextual.app import (
+    AlgorithmSettings,
+    AnalysisErrorScreen,
+    AnalysisPlot,
+    ChargeScanScreen,
     FileSystemNavigator,
     FilterScreen,
     HelpScreen,
     FileViewerApp,
+    InstanceAlreadyRunning,
     NavigationError,
+    SettingsScreen,
+    SingleInstanceLock,
+    adapt_charge_scan_result,
+    analysis_error_advice,
+    dominant_charge_text,
+    event_histogram_text,
     format_size,
+    load_algorithm_settings,
     read_dataset_description,
 )
 
@@ -163,7 +179,9 @@ def test_app_moves_into_directory_and_back(tmp_path: Path) -> None:
     asyncio.run(exercise())
 
 
-def test_folder_mode_preview_keeps_all_dot_d_contents(tmp_path: Path) -> None:
+def test_dot_d_preview_shows_cached_metadata_and_file_sizes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     ordinary = tmp_path / "ordinary"
     ordinary.mkdir()
     (ordinary / "nested").mkdir()
@@ -171,8 +189,26 @@ def test_folder_mode_preview_keeps_all_dot_d_contents(tmp_path: Path) -> None:
     dataset = tmp_path / "sample.d"
     dataset.mkdir()
     (dataset / "inside").mkdir()
-    (dataset / "analysis.tdf").touch()
+    with sqlite3.connect(dataset / "analysis.tdf") as connection:
+        connection.execute(
+            "CREATE TABLE GlobalMetadata (Key TEXT PRIMARY KEY, Value TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO GlobalMetadata (Key, Value) VALUES (?, ?)",
+            ("Description", "HeLa quality-control sample"),
+        )
+    (dataset / "analysis.tdf_bin").write_bytes(bytes(2048))
     (dataset / "raw.bin").touch()
+
+    reads = 0
+    original_reader = app_module._read_dataset_description
+
+    def counted_reader(path: Path) -> tuple[str | None, str | None]:
+        nonlocal reads
+        reads += 1
+        return original_reader(path)
+
+    monkeypatch.setattr(app_module, "_read_dataset_description", counted_reader)
 
     async def exercise() -> None:
         app = FileViewerApp(tmp_path)
@@ -185,9 +221,49 @@ def test_folder_mode_preview_keeps_all_dot_d_contents(tmp_path: Path) -> None:
             await pilot.press("j")
             await pilot.pause()
             rendered = str(preview.render())
-            assert "inside" in rendered
+            assert "HeLa quality-control sample" in rendered
             assert "analysis.tdf" in rendered
-            assert "raw.bin" in rendered
+            assert format_size((dataset / "analysis.tdf").stat().st_size) in rendered
+            assert "2.0 KiB" in rendered
+            assert "inside" not in rendered
+            assert "raw.bin" not in rendered
+            assert reads == 1
+
+            await pilot.press("space")
+            selected = app.query_one("#selected-pane", OptionList)
+            selected_row = str(selected.get_option_at_index(0).prompt)
+            assert reads == 1
+            assert "sample.d" in selected_row
+            assert "HeLa quality-control sample" in selected_row
+            assert str(tmp_path) not in selected_row
+            assert "\n" not in selected_row
+
+    asyncio.run(exercise())
+
+
+def test_selected_nested_dataset_path_is_relative_to_root(tmp_path: Path) -> None:
+    dataset = tmp_path / "e" / "f" / "g" / "folder.d"
+    dataset.mkdir(parents=True)
+    with sqlite3.connect(dataset / "analysis.tdf") as connection:
+        connection.execute(
+            "CREATE TABLE GlobalMetadata (Key TEXT PRIMARY KEY, Value TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO GlobalMetadata (Key, Value) VALUES (?, ?)",
+            ("Description", "Nested sample"),
+        )
+    (dataset / "analysis.tdf_bin").touch()
+
+    async def exercise() -> None:
+        app = FileViewerApp(tmp_path)
+        async with app.run_test(size=(110, 36)) as pilot:
+            await pilot.press("enter", "enter", "enter", "space")
+            selected = app.query_one("#selected-pane", OptionList)
+            row = str(selected.get_option_at_index(0).prompt)
+            assert "e/f/g/folder.d" in row
+            assert "Nested sample" in row
+            assert str(tmp_path) not in row
+            assert not row.lstrip(" ×★").startswith("/")
 
     asyncio.run(exercise())
 
@@ -355,11 +431,17 @@ def test_dot_d_selection_focus_choose_and_remove(tmp_path: Path) -> None:
             await pilot.press("ctrl+down", "k", "space")
             assert selected.highlighted == 0
             assert app.chosen_path == dataset_a.resolve()
+            assert isinstance(app.screen, ChargeScanScreen)
+            await pilot.press("n")
+            await pilot.pause()
 
             await pilot.press("space")
             assert app.chosen_path is None
             await pilot.press("space")
             assert app.chosen_path == dataset_a.resolve()
+            assert isinstance(app.screen, ChargeScanScreen)
+            await pilot.press("n")
+            await pilot.pause()
 
             await pilot.press("x")
             assert app.selected_paths == [dataset_b.resolve()]
@@ -372,3 +454,191 @@ def test_dot_d_selection_focus_choose_and_remove(tmp_path: Path) -> None:
             assert app.selected_paths == []
 
     asyncio.run(exercise())
+
+
+def _fake_charge_result(
+    settings: AlgorithmSettings | None = None,
+) -> charge_regions.ChargeRegionResult:
+    settings = settings or AlgorithmSettings()
+    mz_bins = round(
+        (np.ceil(settings.mz_max) - np.floor(settings.mz_min))
+        / settings.mz_bin_width
+    )
+    intensities = np.zeros(
+        (3, settings.mobility_bins, mz_bins), dtype=np.float64
+    )
+    intensities[0, 10:40, 10:50] = 20.0
+    intensities[1, 35:70, 45:100] = 40.0
+    intensities[2, 65:90, 95:140] = 60.0
+    mobility_edges = np.linspace(0.6, 1.6, settings.mobility_bins + 1)
+    mz_edges = np.linspace(
+        np.floor(settings.mz_min), np.ceil(settings.mz_max), mz_bins + 1
+    )
+    histogram = np.arange(1, 129, dtype=np.uint64)
+    charges = np.array([1, 2, 3], dtype=np.int64)
+    line_data = {"line": {"intercept": 1.55, "slope": -0.0005}}
+    return charge_regions.ChargeRegionResult(
+        intensities=intensities,
+        all_ms1_intensities=intensities.sum(axis=0),
+        raw_event_intensity_histogram=histogram,
+        one_charge_mask=np.zeros((settings.mobility_bins, mz_bins), dtype=bool),
+        non_one_ms1_intensity=123.0,
+        border_mz_mask=np.ones(mz_bins, dtype=bool),
+        polar_origin=np.array([700.0, 1.0]),
+        line_one=np.array([1.2, -0.0002]),
+        line_two=np.array([1.5, -0.0004]),
+        polar_boundary_radius=1.0,
+        polar_boundary=np.array([[350.0, 1200.0], [1.4, 0.9]]),
+        one_charge_is_inner=True,
+        charges=charges,
+        mz_edges=mz_edges,
+        mobility_edges=mobility_edges,
+        sampled_scans_per_mobility_bin=np.full(
+            settings.mobility_bins, 4, dtype=np.uint32
+        ),
+        line_data=line_data,
+        visited_ms1_frames=12,
+        runtime_seconds=1.25,
+        effective_threads=min(settings.threads, settings.mobility_bins),
+    )
+
+
+def test_native_plots_and_direct_analysis_panel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dataset = tmp_path / "sample.d"
+    dataset.mkdir()
+    settings = AlgorithmSettings()
+    result = adapt_charge_scan_result(_fake_charge_result(settings), settings)
+    dominant = dominant_charge_text(result, 80, 14).plain
+    histogram = event_histogram_text(result, 80, 14).plain
+    assert "dominant charge" in dominant
+    assert "X" in dominant
+    assert "1" in dominant and "2" in dominant and "3" in dominant
+    assert "raw MS1 events" in histogram
+    assert "#" in histogram
+
+    calls: list[tuple[Path, dict[str, int | float]]] = []
+
+    def fake_analyse(
+        dataset_path: Path,
+        output_dir: Path | None = None,
+        *,
+        progress: object = None,
+        **arguments: int | float,
+    ) -> charge_regions.ChargeRegionResult:
+        assert output_dir is None
+        calls.append((Path(dataset_path), arguments))
+        if callable(progress):
+            progress("Processed 100 MS1 frames")
+        return _fake_charge_result(settings)
+
+    monkeypatch.setattr(charge_regions, "analyse", fake_analyse)
+
+    async def exercise() -> None:
+        app = FileViewerApp(tmp_path)
+        async with app.run_test(size=(120, 45)) as pilot:
+            await pilot.press("space", "ctrl+down", "space")
+            assert app.chosen_path == dataset.resolve()
+            assert isinstance(app.screen, ChargeScanScreen)
+
+            await pilot.press("y")
+            for _ in range(50):
+                await pilot.pause()
+                if not app._analysis_running:
+                    break
+
+            assert not app._analysis_running
+            assert app.query_one("#analysis-pane").display
+            assert app.query_one("#analysis-tabs").display
+            plot = app.query_one("#analysis-dominant-plot", AnalysisPlot)
+            assert plot.result is not None
+            assert "dominant charge" in str(plot.render())
+            data = str(app.query_one("#analysis-data", Static).render())
+            assert "in memory; no analysis files written" in data
+            assert "12" in data
+            assert "min_intensity = 30.0" in data
+            assert "intercept" in data
+
+    asyncio.run(exercise())
+    assert calls == [(dataset.resolve(), settings.analysis_arguments())]
+    assert list(dataset.iterdir()) == []
+
+
+def test_analysis_error_requires_acknowledgement_and_gives_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dataset = tmp_path / "weak-sample.d"
+    dataset.mkdir()
+    error_message = (
+        "At least three uncensored dominant 1+ cells are required for polar "
+        "fitting."
+    )
+
+    def failing_analyse(*args: object, **kwargs: object) -> None:
+        raise RuntimeError(error_message)
+
+    monkeypatch.setattr(charge_regions, "analyse", failing_analyse)
+
+    async def exercise() -> None:
+        app = FileViewerApp(tmp_path)
+        async with app.run_test(size=(120, 45)) as pilot:
+            await pilot.press("space", "ctrl+down", "space", "y")
+            for _ in range(50):
+                await pilot.pause()
+                if isinstance(app.screen, AnalysisErrorScreen):
+                    break
+
+            assert not app._analysis_running
+            assert isinstance(app.screen, AnalysisErrorScreen)
+            assert error_message in app.screen.error
+            assert "Choose another .d dataset" in app.screen.advice
+            assert "smaller MS1 frame stride" in app.screen.advice
+            assert "RuntimeError" in app.screen.traceback_text
+            assert error_message in app.screen.traceback_text
+
+            await pilot.press("escape")
+            assert isinstance(app.screen, AnalysisErrorScreen)
+            await pilot.click("#analysis-error-ok")
+            await pilot.pause()
+            assert not isinstance(app.screen, AnalysisErrorScreen)
+            assert app.query_one("#selected-pane", OptionList).has_focus
+
+    asyncio.run(exercise())
+
+
+def test_analysis_error_advice_covers_invalid_settings() -> None:
+    advice = analysis_error_advice(ValueError("m/z limits are invalid"))
+    assert "press s" in advice
+    assert "review the algorithm settings" in advice
+
+
+def test_settings_window_saves_validated_toml(tmp_path: Path) -> None:
+    settings_path = tmp_path / ".server" / "settings.toml"
+
+    async def exercise() -> None:
+        app = FileViewerApp(tmp_path, settings_path=settings_path)
+        async with app.run_test(size=(120, 45)) as pilot:
+            assert settings_path.is_file()
+            await pilot.press("s")
+            assert isinstance(app.screen, SettingsScreen)
+            app.screen.query_one("#setting-min_intensity", Input).value = "42.5"
+            await pilot.click("#settings-save")
+            await pilot.pause()
+            assert not isinstance(app.screen, SettingsScreen)
+            assert app.algorithm_settings.min_intensity == 42.5
+            assert load_algorithm_settings(settings_path).min_intensity == 42.5
+            assert "[charge_regions]" in settings_path.read_text()
+
+    asyncio.run(exercise())
+
+
+def test_single_instance_lock_is_exclusive_and_released(tmp_path: Path) -> None:
+    lock_path = tmp_path / "app.lock"
+    with SingleInstanceLock(lock_path):
+        with pytest.raises(InstanceAlreadyRunning):
+            with SingleInstanceLock(lock_path):
+                pass
+
+    with SingleInstanceLock(lock_path):
+        assert lock_path.read_text() == str(os.getpid())

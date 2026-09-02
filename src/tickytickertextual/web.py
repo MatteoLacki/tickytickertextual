@@ -17,6 +17,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", default="127.0.0.1", help="listen address")
     parser.add_argument("--port", default=8000, type=int, help="listen port")
     parser.add_argument("--public-url", help="public URL when running behind a proxy")
+    parser.add_argument(
+        "--settings",
+        type=Path,
+        default=Path("/tmp/tickyticker/settings.toml"),
+        help="server-side charge-regions TOML settings file",
+    )
+    parser.add_argument(
+        "--lock-file",
+        type=Path,
+        default=Path("/tmp/tickyticker/tickytickertextual.lock"),
+        help="single-instance Linux lock file",
+    )
     parser.add_argument("--show-hidden", action="store_true", help="show hidden entries")
     return parser
 
@@ -31,7 +43,16 @@ def main(argv: Sequence[str] | None = None) -> None:
     if not root.is_dir():
         raise SystemExit(f"Root is not a directory: {root}")
 
-    command_parts = [sys.executable, "-m", "tickytickertextual.app", str(root)]
+    command_parts = [
+        sys.executable,
+        "-m",
+        "tickytickertextual.app",
+        str(root),
+        "--settings",
+        str(args.settings),
+        "--lock-file",
+        str(args.lock_file),
+    ]
     if args.show_hidden:
         command_parts.append("--show-hidden")
     command = shlex.join(command_parts)
@@ -49,4 +70,3 @@ def main(argv: Sequence[str] | None = None) -> None:
 
 if __name__ == "__main__":
     main()
-
