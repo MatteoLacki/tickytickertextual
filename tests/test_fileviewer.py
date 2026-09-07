@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 from tickyticker import charge_regions
-from textual.widgets import Input, OptionList, Static
+from textual.widgets import Input, OptionList, Static, TabbedContent
 
 from tickytickertextual import app as app_module
 from tickytickertextual import web
@@ -20,6 +20,7 @@ from tickytickertextual.app import (
     FileSystemNavigator,
     FilterScreen,
     HelpScreen,
+    HISTOGRAM_THRESHOLD_STYLE,
     FileViewerApp,
     InstanceAlreadyRunning,
     NavigationError,
@@ -30,6 +31,7 @@ from tickytickertextual.app import (
     dominant_charge_svg,
     dominant_charge_text,
     event_histogram_text,
+    format_duration,
     format_size,
     load_algorithm_settings,
     read_dataset_description,
@@ -124,6 +126,20 @@ def test_reads_dataset_description_from_global_metadata(tmp_path: Path) -> None:
 )
 def test_format_size(value: int | None, expected: str) -> None:
     assert format_size(value) == expected
+
+
+@pytest.mark.parametrize(
+    ("seconds", "expected"),
+    [
+        (None, "unavailable"),
+        (0.0, "0s"),
+        (42.0, "42s"),
+        (1498.964768, "24m59s"),
+        (3661.0, "1h01m01s"),
+    ],
+)
+def test_format_duration(seconds: float | None, expected: str) -> None:
+    assert format_duration(seconds) == expected
 
 
 def test_app_moves_into_directory_and_back(tmp_path: Path) -> None:
@@ -241,9 +257,21 @@ def test_dot_d_preview_shows_cached_metadata_and_file_sizes(
                 .get_option_at_index(0)
                 .prompt
             )
+            current_header = str(
+                app.query_one("#current-header", Static).render()
+            )
             assert current_row.index("│") == ordinary_row.index("│")
+            assert current_row.index("│") == current_header.index("│")
+            assert "Path" in current_header
+            assert "Gradient" in current_header
             assert "acq. m/z" not in current_row
-            assert "Gradient 1h01m01s" in current_row
+            assert "Gradient" not in current_row
+            assert "1h01m01s" in current_row
+            assert current_row.endswith("s ")
+            assert (
+                current_header.index("Gradient") + len("Gradient")
+                == current_row.index("1h01m01s") + len("1h01m01s")
+            )
             assert "HeLa quality-control sample" in rendered
             assert "Acquisition m/z" in rendered
             assert "99.9936 – 1700" in rendered
@@ -259,14 +287,29 @@ def test_dot_d_preview_shows_cached_metadata_and_file_sizes(
             await pilot.press("space")
             selected = app.query_one("#selected-pane", OptionList)
             selected_row = str(selected.get_option_at_index(0).prompt)
+            selected_header = str(
+                app.query_one("#selected-header", Static).render()
+            )
             assert reads == 1
             assert "sample.d" in selected_row
             assert "HeLa quality-control sample" in selected_row
             assert "Acq. m/z" not in selected_row
             assert "99.9936" not in selected_row
+            assert all(
+                heading in selected_header
+                for heading in (
+                    "Path",
+                    "Description",
+                    "Below",
+                    "Above",
+                    "Fit Parameters",
+                )
+            )
+            assert "Below" not in selected_row
+            assert "Above" not in selected_row
             assert selected_row.index("sample.d") < selected_row.index(
                 "HeLa quality-control sample"
-            ) < selected_row.index("Below") < selected_row.index("Above")
+            )
             assert str(tmp_path) not in selected_row
             assert "\n" not in selected_row
 
@@ -482,7 +525,7 @@ def test_dot_d_selection_focus_choose_and_remove(tmp_path: Path) -> None:
             assert str(current.get_option_at_index(1).prompt).startswith("▸ ")
             assert str(current.get_option_at_index(2).prompt).startswith("✓ ")
 
-            await pilot.click("#selected-pane", offset=(2, 1))
+            await pilot.click("#selected-pane", offset=(2, 0))
             await pilot.pause()
             assert app.selected_paths == []
 
@@ -582,12 +625,28 @@ def test_modal_review_svg_and_accepted_split_tic(
     settings = AlgorithmSettings()
     result = adapt_charge_scan_result(_fake_charge_result(settings), settings)
     dominant = dominant_charge_text(result, 80, 14).plain
-    histogram = event_histogram_text(result, 80, 14).plain
+    histogram_render = event_histogram_text(result, 80, 14)
+    histogram = histogram_render.plain
     assert "dominant charge" in dominant
     assert "X" in dominant
     assert "1" in dominant and "2" in dominant and "3" in dominant
-    assert "raw MS1 events" in histogram
+    assert "event count (log scale)" in histogram
+    assert "raw intensity" in histogram
     assert "#" in histogram
+    minimum_start = histogram.index("minimum=30")
+    minimum_end = minimum_start + len("minimum=30")
+    threshold_marker = histogram.rindex("*")
+    assert any(
+        span.start <= minimum_start
+        and span.end >= minimum_end
+        and span.style == HISTOGRAM_THRESHOLD_STYLE
+        for span in histogram_render.spans
+    )
+    assert any(
+        span.start <= threshold_marker < span.end
+        and span.style == HISTOGRAM_THRESHOLD_STYLE
+        for span in histogram_render.spans
+    )
     svg = dominant_charge_svg(result)
     assert svg.startswith("<?xml")
     assert "Dominant charge and fitted 1+/multicharge separator" in svg
@@ -649,11 +708,22 @@ def test_modal_review_svg_and_accepted_split_tic(
             assert review.query_one("#scan-tabs").display
             plot = review.query_one("#scan-dominant-plot", AnalysisPlot)
             assert plot.result is not None
-            assert "dominant charge" in str(plot.render())
+            held_result = plot.result
+            original_render_key = plot._last_render_key
+            original_plot = str(plot.render())
+            assert "dominant charge" in original_plot
+            await pilot.resize_terminal(90, 36)
+            await pilot.pause()
+            assert plot.result is held_result
+            assert plot._last_render_key != original_render_key
+            assert str(plot.render()) != original_plot
             compact_histogram = review.query_one(
                 "#scan-histogram-plot", AnalysisPlot
             )
-            assert "raw MS1 events" in str(compact_histogram.render())
+            tabs = review.query_one("#scan-tabs", TabbedContent)
+            tabs.active = "scan-histogram"
+            await pilot.pause()
+            assert "event count (log scale)" in str(compact_histogram.render())
             fit = str(review.query_one("#scan-fit-parameters", Static).render())
             assert "intercept" in fit
             assert "slope" in fit
@@ -681,9 +751,12 @@ def test_modal_review_svg_and_accepted_split_tic(
                 .get_option_at_index(0)
                 .prompt
             )
-            assert "Below 100 (100.0% HeLa)" in selected_row
-            assert "Above 200 (100.0% HeLa)" in selected_row
-            assert "Fit 1/K0" in selected_row
+            assert "100 (100.0%)" in selected_row
+            assert "200 (100.0%)" in selected_row
+            assert "a=1.55" in selected_row
+            assert "b=-0.0005" in selected_row
+            assert "Below" not in selected_row
+            assert "Above" not in selected_row
 
     asyncio.run(exercise())
     assert calls == [(dataset.resolve(), settings.analysis_arguments())]
@@ -760,17 +833,19 @@ def test_split_tic_continues_after_dataset_error(
             hela_row = str(selected.get_option_at_index(0).prompt)
             sample_row = str(selected.get_option_at_index(1).prompt)
             broken_row = str(selected.get_option_at_index(2).prompt)
-            assert "Below 100 (100.0% HeLa)" in hela_row
-            assert "Above 200 (100.0% HeLa)" in hela_row
-            assert "Below 50 (50.0% HeLa)" in sample_row
-            assert "Above 400 (200.0% HeLa)" in sample_row
-            assert "Below ERROR" in broken_row
-            assert "Above ERROR" in broken_row
+            assert "100 (100.0%)" in hela_row
+            assert "200 (100.0%)" in hela_row
+            assert "50 (50.0%)" in sample_row
+            assert "400 (200.0%)" in sample_row
+            assert broken_row.count("ERROR") == 2
+            assert "a=1.55" in hela_row
+            assert "a=1.55" not in sample_row
+            assert "a=1.55" not in broken_row
             separators = [
                 [index for index, character in enumerate(row) if character == "│"]
                 for row in (hela_row, sample_row, broken_row)
             ]
-            assert separators[0][:3] == separators[1][:3] == separators[2][:3]
+            assert separators[0] == separators[1] == separators[2]
             assert isinstance(app.screen, AnalysisErrorScreen)
             assert app.screen.error_title == "SELECTED-DATASET TIC FAILED"
             assert "Failed rows remain marked ERROR" in app.screen.advice

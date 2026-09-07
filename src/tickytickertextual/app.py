@@ -24,7 +24,7 @@ from tickyticker import charge_regions
 from textual import events, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Container, Horizontal, VerticalScroll
+from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widgets import (
@@ -384,6 +384,8 @@ def _block_sum(values: np.ndarray, rows: int, columns: int) -> np.ndarray:
 
 
 ASCII_LEVELS = " .:-=+*#%@"
+HISTOGRAM_BAR_STYLE = "bold #4c78a8"
+HISTOGRAM_THRESHOLD_STYLE = "bold #f2cc60"
 
 CHARGE_STYLES = {
     0: "dim #484f58",
@@ -625,7 +627,7 @@ def event_histogram_text(
     result: ChargeScanResult, width: int, height: int
 ) -> Text:
     """Render a compact vertical log histogram, retaining one or two bins."""
-    available_columns = max(8, width - 8)
+    available_columns = max(8, width - 14)
     if available_columns >= 128:
         group_size = 1
     elif available_columns >= 64:
@@ -643,7 +645,9 @@ def event_histogram_text(
     )
     logarithms = np.log1p(grouped.astype(np.float64))
     maximum = float(logarithms.max()) if logarithms.size else 0.0
-    plot_rows = max(4, min(height - 4, 10))
+    maximum_count = int(grouped.max()) if grouped.size else 0
+    y_width = max(5, len(f"{maximum_count:,}"))
+    plot_rows = max(3, min(height - 5, 10))
     heights = (
         np.zeros(grouped.size, dtype=int)
         if maximum == 0
@@ -654,24 +658,59 @@ def event_histogram_text(
     )
     threshold_column = threshold_bin // group_size
     output = Text(no_wrap=True)
+    output.append("event count (log scale) ↑", style="bold #8be9fd")
+    output.append(chr(10))
+    output.append("raw intensity · ", style="bold")
     output.append(
-        "raw MS1 events · log count · "
-        f"{group_size} intensity bin{'s' if group_size > 1 else ''}/column · "
-        f"minimum={result.settings.min_intensity:g} (*)",
+        f"{group_size} bin{'s' if group_size > 1 else ''}/column · ",
         style="bold",
     )
+    output.append(
+        f"minimum={result.settings.min_intensity:g} (*)",
+        style=HISTOGRAM_THRESHOLD_STYLE,
+    )
     output.append(chr(10))
+    tick_rows = {plot_rows, max(1, plot_rows // 2), 1}
     for row in range(plot_rows, 0, -1):
-        output.append("  |", style="dim")
+        if row in tick_rows and maximum > 0:
+            tick_count = int(round(np.expm1(maximum * row / plot_rows)))
+            tick_label = f"{tick_count:,}"
+        else:
+            tick_label = ""
+        output.append(f"{tick_label:>{y_width}} |", style="dim")
         for column, bar_height in enumerate(heights):
             character = "#" if bar_height >= row else " "
-            style = "bold #f2cc60" if column == threshold_column else "bold #4c78a8"
+            style = (
+                HISTOGRAM_THRESHOLD_STYLE
+                if column == threshold_column
+                else HISTOGRAM_BAR_STYLE
+            )
             output.append(character, style=style)
         output.append(chr(10))
-    output.append("  +" + "-" * grouped.size, style="dim")
+    output.append(f"{0:>{y_width}} +", style="dim")
+    for column in range(grouped.size):
+        output.append(
+            "-",
+            style=(
+                HISTOGRAM_THRESHOLD_STYLE
+                if column == threshold_column
+                else "dim"
+            ),
+        )
     output.append(chr(10))
+    output.append(" " * (y_width + 2))
+    for column in range(grouped.size):
+        output.append(
+            "*" if column == threshold_column else " ",
+            style=HISTOGRAM_THRESHOLD_STYLE,
+        )
+    output.append(chr(10))
+    left_label = "1"
+    right_label = "≥128"
+    gap = max(1, grouped.size - len(left_label) - len(right_label))
+    output.append(" " * (y_width + 2), style="dim")
     output.append(
-        f"   1{' ' * max(1, grouped.size - 6)}>=128",
+        left_label + " " * gap + right_label,
         style="dim",
     )
     return output
@@ -970,19 +1009,28 @@ def _acquisition_mz_text(metadata: DatasetMetadata) -> str:
 
 def _gradient_length_text(metadata: DatasetMetadata) -> str:
     """Format the cached Frames.Time span as hours, minutes, and seconds."""
-    if metadata.gradient_length_seconds is None:
+    return format_duration(metadata.gradient_length_seconds)
+
+
+def format_duration(seconds_value: float | None) -> str:
+    """Format seconds without zero-valued leading hour or minute units."""
+    if seconds_value is None:
         return "unavailable"
-    total_seconds = max(0, int(round(metadata.gradient_length_seconds)))
+    total_seconds = max(0, int(round(seconds_value)))
     hours, remainder = divmod(total_seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
-    return f"{hours}h{minutes:02d}m{seconds:02d}s"
+    if hours:
+        return f"{hours}h{minutes:02d}m{seconds:02d}s"
+    if minutes:
+        return f"{minutes}m{seconds:02d}s"
+    return f"{seconds}s"
 
 
-def _column_cell(value: str, width: int) -> str:
+def _column_cell(value: str, width: int, *, right: bool = False) -> str:
     """Pad or ellipsize a string to an exact terminal-cell column width."""
     if len(value) > width:
         return value[: max(0, width - 1)] + "…"
-    return value.ljust(width)
+    return value.rjust(width) if right else value.ljust(width)
 
 
 def _column_width(
@@ -992,6 +1040,19 @@ def _column_width(
     width = max((len(value) for value in values), default=minimum)
     width = max(minimum, width)
     return min(width, maximum) if maximum is not None else width
+
+
+def _gradient_cell_text(
+    entry: FileEntry, metadata: DatasetMetadata | None
+) -> str:
+    """Return the on-demand gradient value for a current-pane row."""
+    if not entry.is_dir or not entry.name.casefold().endswith(".d"):
+        return ""
+    if metadata is None:
+        return "…"
+    if metadata.gradient_length_error is not None:
+        return "unavailable"
+    return _gradient_length_text(metadata)
 
 
 def _matches_name_filter(name: str, pattern: str | None) -> bool:
@@ -1007,6 +1068,7 @@ def _entry_label(
     marked: bool = False,
     metadata: DatasetMetadata | None = None,
     name_width: int | None = None,
+    gradient_width: int | None = None,
 ) -> Text:
     label = Text(no_wrap=True, overflow="ellipsis")
     if entry.is_dir:
@@ -1039,16 +1101,22 @@ def _entry_label(
         )
     if name_width is not None:
         label.append(" │ ", style="dim")
-        if entry.is_dir and entry.name.casefold().endswith(".d"):
-            label.append("Gradient ", style="dim italic")
-            if metadata is None:
-                label.append("…", style="dim")
-            elif metadata.gradient_length_error is None:
-                label.append(
-                    _gradient_length_text(metadata), style="bold #54a24b"
-                )
-            else:
-                label.append("unavailable", style="italic #ff7b72")
+        gradient = _gradient_cell_text(entry, metadata)
+        if gradient == "unavailable":
+            gradient_style = "italic #ff7b72"
+        elif gradient in {"", "…"}:
+            gradient_style = "dim"
+        else:
+            gradient_style = "bold #54a24b"
+        label.append(
+            _column_cell(
+                gradient,
+                gradient_width or len(gradient),
+                right=True,
+            ),
+            style=gradient_style,
+        )
+        label.append(" ")
     return label
 
 
@@ -1068,6 +1136,14 @@ def _listing_text(
     if truncated:
         output.append("… more entries not read", style="dim italic")
     return output
+
+
+class TableResizeRequested(Message):
+    """Ask the app to recompute terminal table columns after layout."""
+
+    def __init__(self, table_id: str | None) -> None:
+        super().__init__()
+        self.table_id = table_id
 
 
 class CurrentOptionList(OptionList):
@@ -1100,6 +1176,9 @@ class CurrentOptionList(OptionList):
         Binding("H,shift+h", "app.show_help", "Help", key_display="Shift+H"),
     ]
 
+    def on_resize(self, event: events.Resize) -> None:
+        self.post_message(TableResizeRequested(self.id))
+
 
 class SelectedOptionList(OptionList):
     """Option list with a clickable remove control on each row."""
@@ -1131,6 +1210,9 @@ class SelectedOptionList(OptionList):
         def __init__(self, index: int) -> None:
             super().__init__()
             self.index = index
+
+    def on_resize(self, event: events.Resize) -> None:
+        self.post_message(TableResizeRequested(self.id))
 
     async def _on_click(self, event: events.Click) -> None:
         remove_index = event.style.meta.get("remove-selected")
@@ -1194,9 +1276,17 @@ def _selected_tic_cells(
         tic_state.tic_above_line, above_reference, chosen=chosen
     )
     return (
-        f"{tic_state.tic_below_line:,} ({below_relative} HeLa)",
-        f"{tic_state.tic_above_line:,} ({above_relative} HeLa)",
+        f"{tic_state.tic_below_line:,} ({below_relative})",
+        f"{tic_state.tic_above_line:,} ({above_relative})",
     )
+
+
+def _fit_cell_text(fitted_line: tuple[float, float] | None) -> str:
+    """Format compact separator parameters for the selected table."""
+    if fitted_line is None:
+        return ""
+    intercept, slope = fitted_line
+    return f"a={intercept:.6g}  b={slope:+.6g}"
 
 
 def _selected_path_label(
@@ -1207,13 +1297,14 @@ def _selected_path_label(
     chosen: bool,
     description: str | None,
     description_error: str | None,
-    fitted_line: tuple[float, float] | None,
+    fit_text: str,
     tic_state: DatasetTicState | None,
     hela_tic_state: DatasetTicState | None,
     path_width: int,
     description_width: int,
     below_width: int,
     above_width: int,
+    fit_width: int,
 ) -> Text:
     relative_path = str(path.relative_to(root))
     description_text = _selected_description(description, description_error)
@@ -1239,19 +1330,21 @@ def _selected_path_label(
         _column_cell(description_text, description_width),
         style="bold yellow" if chosen else "italic #8b949e",
     )
-    label.append(" │ Below ", style="dim italic")
+    label.append(" │ ", style="dim")
     tic_style = "bold #ff7b72" if below_text == "ERROR" else "bold #8be9fd"
-    label.append(_column_cell(below_text, below_width), style=tic_style)
-    label.append(" │ Above ", style="dim italic")
+    label.append(
+        _column_cell(below_text, below_width, right=True), style=tic_style
+    )
+    label.append(" │ ", style="dim")
     tic_style = "bold #ff7b72" if above_text == "ERROR" else "bold #8be9fd"
-    label.append(_column_cell(above_text, above_width), style=tic_style)
-    if fitted_line is not None:
-        intercept, slope = fitted_line
-        label.append(" │ Fit ", style="dim italic")
-        label.append(
-            f"1/K0 = {intercept:.6g} {slope:+.6g}×m/z",
-            style="bold #f2cc60",
-        )
+    label.append(
+        _column_cell(above_text, above_width, right=True), style=tic_style
+    )
+    label.append(" │ ", style="dim")
+    label.append(
+        _column_cell(fit_text, fit_width),
+        style="bold #f2cc60" if fit_text else "dim",
+    )
     if chosen:
         label.stylize("on #3d3200")
     return label
@@ -1264,23 +1357,38 @@ class AnalysisPlot(Static):
         super().__init__("", id=id, markup=False)
         self.mode = mode
         self.result: ChargeScanResult | None = None
+        self._last_render_key: tuple[int, int, int] | None = None
 
     def show_result(self, result: ChargeScanResult) -> None:
         self.result = result
-        self._redraw()
-        self.call_after_refresh(self._redraw)
+        self._last_render_key = None
+        self.redraw()
+        self.call_after_refresh(self.redraw)
 
     def on_resize(self, event: events.Resize) -> None:
         self._redraw(event.size.width, event.size.height)
 
+    def redraw(self) -> None:
+        """Force a redraw after visibility or tab-layout changes."""
+        self._redraw(force=True)
+
     def _redraw(
-        self, width: int | None = None, height: int | None = None
+        self,
+        width: int | None = None,
+        height: int | None = None,
+        *,
+        force: bool = False,
     ) -> None:
         if self.result is None:
             self.update(Text("waiting for analysis data", style="dim italic"))
             return
         plot_width = width if width is not None else self.size.width
         plot_height = height if height is not None else self.size.height
+        if plot_width <= 0 or plot_height <= 0:
+            return
+        render_key = (id(self.result), plot_width, plot_height)
+        if not force and render_key == self._last_render_key:
+            return
         if self.mode == "dominant":
             rendered = dominant_charge_text(
                 self.result, plot_width, plot_height
@@ -1290,6 +1398,7 @@ class AnalysisPlot(Static):
                 self.result, plot_width, plot_height
             )
         self.update(rendered)
+        self._last_render_key = render_key
 
 
 def fit_parameters_text(result: ChargeScanResult) -> Text:
@@ -1460,6 +1569,14 @@ class ChargeScanScreen(ModalScreen[ChargeScanResult | None]):
             self.action_decline()
         elif event.button.id == "scan-yes":
             self.action_confirm()
+
+    def on_tabbed_content_tab_activated(
+        self, event: TabbedContent.TabActivated
+    ) -> None:
+        if event.tabbed_content.id != "scan-tabs":
+            return
+        for plot in event.pane.query(AnalysisPlot):
+            plot.call_after_refresh(plot.redraw)
 
     def action_decline(self) -> None:
         if self.state != "loading":
@@ -2022,13 +2139,32 @@ class FileViewerApp(App[None]):
         border: tall #58a6ff;
     }
 
+    #current-region:focus-within, #selected-region:focus-within {
+        border: tall #58a6ff;
+    }
+
+    .table-header {
+        height: 1;
+        padding: 0;
+        background: #161b22;
+        color: #8be9fd;
+        text-style: bold;
+    }
+
     #parent-pane {
         width: 1fr;
     }
 
-    #current-pane {
+    #current-region {
         width: 2fr;
         padding: 0;
+    }
+
+    #current-pane {
+        width: 1fr;
+        height: 1fr;
+        padding: 0;
+        border: none;
     }
 
     #preview-pane {
@@ -2041,10 +2177,17 @@ class FileViewerApp(App[None]):
         text-style: bold;
     }
 
-    #selected-pane {
+    #selected-region {
         height: 1fr;
         min-height: 5;
         padding: 0;
+    }
+
+    #selected-pane {
+        width: 1fr;
+        height: 1fr;
+        padding: 0;
+        border: none;
     }
 
     #status-bar {
@@ -2129,18 +2272,27 @@ class FileViewerApp(App[None]):
         yield Static(id="path-bar")
         with Horizontal(id="panes"):
             yield Static(id="parent-pane", classes="pane")
-            yield CurrentOptionList(id="current-pane", classes="pane", markup=False, compact=True)
+            with Vertical(id="current-region", classes="pane"):
+                yield Static(id="current-header", classes="table-header")
+                yield CurrentOptionList(
+                    id="current-pane", markup=False, compact=True
+                )
             yield Static(id="preview-pane", classes="pane")
-        yield SelectedOptionList(id="selected-pane", classes="pane", markup=False, compact=True)
+        with Vertical(id="selected-region", classes="pane"):
+            yield Static(id="selected-header", classes="table-header")
+            yield SelectedOptionList(
+                id="selected-pane", markup=False, compact=True
+            )
         yield Static(id="status-bar")
         yield Footer(compact=True)
 
     def on_mount(self) -> None:
         self.query_one("#parent-pane").border_title = "parent"
-        self.query_one("#current-pane").border_title = "current"
+        self.query_one("#current-region").border_title = "current"
         self.query_one("#preview-pane").border_title = "selection"
-        self.query_one("#selected-pane").border_title = ":selected:"
+        self.query_one("#selected-region").border_title = ":selected:"
         self._open_directory(self.navigator.root)
+        self._refresh_selected_pane()
         current = self.query_one("#current-pane", CurrentOptionList)
         current.focus()
         self.call_after_refresh(current.focus)
@@ -2161,6 +2313,14 @@ class FileViewerApp(App[None]):
         self, event: SelectedOptionList.RemoveRequested
     ) -> None:
         self._remove_selected_at(event.index)
+
+    def on_table_resize_requested(
+        self, event: TableResizeRequested
+    ) -> None:
+        if event.table_id == "current-pane":
+            self._refresh_current_marks()
+        elif event.table_id == "selected-pane":
+            self._refresh_selected_pane()
 
     def _focused_option_list(self) -> OptionList:
         selected = self.query_one("#selected-pane", SelectedOptionList)
@@ -2368,18 +2528,75 @@ class FileViewerApp(App[None]):
             )
             for path in self.selected_paths
         ]
-        path_width = _column_width(
-            relative_paths, minimum=16, maximum=44
-        )
-        description_width = _column_width(
-            descriptions, minimum=20, maximum=40
-        )
+        fit_texts = [
+            _fit_cell_text(
+                fitted_line if path == self.chosen_path else None
+            )
+            for path in self.selected_paths
+        ]
         below_width = _column_width(
-            (below for below, _ in tic_cells), minimum=20
+            ["Below", *(below for below, _ in tic_cells)], minimum=5
         )
         above_width = _column_width(
-            (above for _, above in tic_cells), minimum=20
+            ["Above", *(above for _, above in tic_cells)], minimum=5
         )
+        fit_width = _column_width(
+            ["Fit Parameters", *fit_texts], minimum=14
+        )
+        desired_path_width = _column_width(
+            ["Path", *relative_paths], minimum=12, maximum=44
+        )
+        desired_description_width = _column_width(
+            ["Description", *descriptions], minimum=16, maximum=40
+        )
+        fixed_width = 5 + 12 + below_width + above_width + fit_width
+        available_width = selected.size.width
+        if available_width <= 0:
+            available_width = (
+                fixed_width
+                + desired_path_width
+                + desired_description_width
+            )
+        flexible_width = max(16, available_width - fixed_width)
+        if flexible_width >= (
+            desired_path_width + desired_description_width
+        ):
+            path_width = desired_path_width
+            description_width = desired_description_width
+        else:
+            path_width = min(
+                desired_path_width, max(8, flexible_width // 2)
+            )
+            description_width = min(
+                desired_description_width,
+                max(8, flexible_width - path_width),
+            )
+            overflow = path_width + description_width - flexible_width
+            if overflow > 0:
+                if description_width >= path_width:
+                    description_width -= overflow
+                else:
+                    path_width -= overflow
+
+        selected_header = Text(no_wrap=True)
+        selected_header.append(" " * 5)
+        selected_header.append(_column_cell("Path", path_width))
+        selected_header.append(" │ ", style="dim")
+        selected_header.append(
+            _column_cell("Description", description_width)
+        )
+        selected_header.append(" │ ", style="dim")
+        selected_header.append(
+            _column_cell("Below", below_width, right=True)
+        )
+        selected_header.append(" │ ", style="dim")
+        selected_header.append(
+            _column_cell("Above", above_width, right=True)
+        )
+        selected_header.append(" │ ", style="dim")
+        selected_header.append(_column_cell("Fit Parameters", fit_width))
+        self.query_one("#selected-header", Static).update(selected_header)
+
         selected.set_options(
             [
                 _selected_path_label(
@@ -2389,15 +2606,14 @@ class FileViewerApp(App[None]):
                     chosen=path == self.chosen_path,
                     description=self.selected_descriptions.get(path),
                     description_error=self.selected_description_errors.get(path),
-                    fitted_line=(
-                        fitted_line if path == self.chosen_path else None
-                    ),
+                    fit_text=fit_texts[index],
                     tic_state=self.tic_states.get(path),
                     hela_tic_state=hela_tic_state,
                     path_width=path_width,
                     description_width=description_width,
                     below_width=below_width,
                     above_width=above_width,
+                    fit_width=fit_width,
                 )
                 for index, path in enumerate(self.selected_paths)
             ]
@@ -2411,6 +2627,16 @@ class FileViewerApp(App[None]):
 
     def _refresh_current_marks(self) -> None:
         current = self.query_one("#current-pane", CurrentOptionList)
+        name_width, gradient_width = self._current_table_widths()
+        current_header = Text(no_wrap=True)
+        current_header.append("  ")
+        current_header.append(_column_cell("Path", name_width))
+        current_header.append(" │ ", style="dim")
+        current_header.append(
+            _column_cell("Gradient", gradient_width, right=True)
+        )
+        current_header.append(" ")
+        self.query_one("#current-header", Static).update(current_header)
         for index, entry in enumerate(self.entries):
             current.replace_option_prompt_at_index(
                 index,
@@ -2418,7 +2644,8 @@ class FileViewerApp(App[None]):
                     entry,
                     marked=entry.path in self.selected_paths,
                     metadata=self.dataset_metadata_cache.get(entry.path),
-                    name_width=self._current_name_column_width(),
+                    name_width=name_width,
+                    gradient_width=gradient_width,
                 ),
             )
 
@@ -2767,16 +2994,35 @@ class FileViewerApp(App[None]):
             self.dataset_metadata_cache[path] = metadata
         return metadata
 
-    def _current_name_column_width(self) -> int:
-        """Return one bounded filename column width for the current pane."""
+    def _current_table_widths(self) -> tuple[int, int]:
+        """Fit Path and right-aligned Gradient columns to the current pane."""
+        current = self.query_one("#current-pane", CurrentOptionList)
         names = [
             f"{entry.name}/" if entry.is_dir else entry.name
             for entry in self.entries
         ]
-        return _column_width(names, minimum=12, maximum=44)
+        gradient_values = [
+            _gradient_cell_text(
+                entry, self.dataset_metadata_cache.get(entry.path)
+            )
+            for entry in self.entries
+        ]
+        gradient_width = _column_width(
+            ["Gradient", *gradient_values], minimum=8
+        )
+        if current.size.width > 0:
+            name_width = max(
+                8, current.size.width - 2 - 3 - gradient_width - 1
+            )
+        else:
+            name_width = _column_width(
+                ["Path", *names], minimum=12, maximum=44
+            )
+        return name_width, gradient_width
 
-
-    def _open_directory(self, path: Path, *, highlight_name: str | None = None) -> None:
+    def _open_directory(
+        self, path: Path, *, highlight_name: str | None = None
+    ) -> None:
         try:
             listing = self.navigator.change_directory(
                 path, directories_only=self.folders_only
@@ -2790,7 +3036,7 @@ class FileViewerApp(App[None]):
             for entry in listing.entries
             if _matches_name_filter(entry.name, self.name_filter)
         )
-        name_width = self._current_name_column_width()
+        name_width, gradient_width = self._current_table_widths()
         option_list = self.query_one("#current-pane", OptionList)
         option_list.set_options(
             [
@@ -2799,10 +3045,12 @@ class FileViewerApp(App[None]):
                     marked=entry.path in self.selected_paths,
                     metadata=self.dataset_metadata_cache.get(entry.path),
                     name_width=name_width,
+                    gradient_width=gradient_width,
                 )
                 for entry in self.entries
             ]
         )
+        self._refresh_current_marks()
 
         highlighted = 0 if self.entries else None
         if highlight_name is not None:
@@ -2872,17 +3120,7 @@ class FileViewerApp(App[None]):
             preview.update(
                 _dataset_metadata_text(entry.path, metadata)
             )
-            self.query_one(
-                "#current-pane", CurrentOptionList
-            ).replace_option_prompt_at_index(
-                index,
-                _entry_label(
-                    entry,
-                    marked=entry.path in self.selected_paths,
-                    metadata=metadata,
-                    name_width=self._current_name_column_width(),
-                ),
-            )
+            self._refresh_current_marks()
         elif entry.is_dir:
             try:
                 listing = self.navigator.scan(
