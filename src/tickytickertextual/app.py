@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import fcntl
 import fnmatch
-import json
 import os
 import stat
 import sqlite3
@@ -73,20 +72,25 @@ class DatasetMetadata:
 
     description: str | None
     description_error: str | None
+    mz_acquisition_min: float | None
+    mz_acquisition_max: float | None
+    mz_acquisition_error: str | None
+    gradient_length_seconds: float | None
+    gradient_length_error: str | None
     analysis_tdf_size: int | None
     analysis_tdf_bin_size: int | None
 
 
 SETTING_DEFINITIONS = (
+    ("mz_min", "Comparison m/z: minimum", float),
+    ("mz_max", "Comparison m/z: maximum", float),
+    ("min_intensity", "Minimum raw-event intensity", float),
+    ("frame_stride", "MS1 frame stride", int),
     ("isotope_count", "Isotope count", int),
     ("mobility_bins", "Mobility bins", int),
-    ("mz_min", "Minimum m/z", float),
-    ("mz_max", "Maximum m/z", float),
     ("mz_bin_width", "Final m/z bin width", float),
-    ("min_intensity", "Minimum raw-event intensity", float),
     ("border_mz_left", "Border fit: left m/z", float),
     ("border_mz_right", "Border fit: right m/z", float),
-    ("frame_stride", "MS1 frame stride", int),
     ("threads", "Numba threads", int),
     ("scans_per_mobility_bin", "Scans per mobility bin (0 = all)", int),
 )
@@ -104,34 +108,38 @@ class InstanceAlreadyRunning(RuntimeError):
 class AlgorithmSettings:
     """The configurable charge-regions command-line parameters."""
 
-    isotope_count: int = 3
-    mobility_bins: int = 100
     mz_min: float = 100.0
     mz_max: float = 1700.0
-    mz_bin_width: float = 10.0
     min_intensity: float = 30.0
+    frame_stride: int = 1
+    isotope_count: int = 3
+    mobility_bins: int = 100
+    mz_bin_width: float = 10.0
     border_mz_left: float = 350.0
     border_mz_right: float = 1200.0
-    frame_stride: int = 1
     threads: int = 3
     scans_per_mobility_bin: int = 0
 
     def validate(self) -> None:
+        if not np.isfinite(self.mz_min) or not np.isfinite(self.mz_max):
+            raise ConfigurationError("Comparison m/z limits must be finite")
+        if self.mz_min >= self.mz_max:
+            raise ConfigurationError("Comparison m/z limits must be ordered")
         if self.isotope_count < 1 or self.mobility_bins < 1:
             raise ConfigurationError(
                 "Isotope count and mobility bins must be at least 1"
             )
-        if self.mz_max <= self.mz_min or self.mz_bin_width <= 0:
-            raise ConfigurationError(
-                "Maximum m/z must exceed minimum m/z and bin width must be positive"
-            )
+        if self.mz_bin_width <= 0:
+            raise ConfigurationError("Final m/z bin width must be positive")
         fine_bin_count = round(self.mz_bin_width * 12.0)
         if not np.isclose(fine_bin_count / 12.0, self.mz_bin_width):
             raise ConfigurationError(
                 "Final m/z bin width must be an integer multiple of 1/12 Da"
             )
-        if self.min_intensity < 0:
-            raise ConfigurationError("Minimum intensity cannot be negative")
+        if not np.isfinite(self.min_intensity) or self.min_intensity < 0:
+            raise ConfigurationError(
+                "Minimum intensity must be finite and nonnegative"
+            )
         if self.frame_stride < 1 or self.threads < 1:
             raise ConfigurationError("Frame stride and threads must be at least 1")
         if self.scans_per_mobility_bin < 0:
@@ -143,7 +151,7 @@ class AlgorithmSettings:
             <= self.mz_max
         ):
             raise ConfigurationError(
-                "Border limits must be ordered inside the analysis m/z range"
+                "Border m/z limits must be ordered inside the comparison range"
             )
 
     def analysis_arguments(self) -> dict[str, int | float]:
@@ -218,6 +226,8 @@ def load_algorithm_settings(path: Path) -> AlgorithmSettings:
             values[name] = float(raw_value)
     settings = AlgorithmSettings(**values)
     settings.validate()
+    if {"mz_min", "mz_max"} - section.keys():
+        save_algorithm_settings(path, settings)
     return settings
 
 
@@ -270,6 +280,16 @@ class ChargeScanResult:
     effective_threads: int
 
 
+@dataclass(frozen=True, slots=True)
+class DatasetTicState:
+    """Current below/above-line TIC state for one selected dataset."""
+
+    status: str
+    tic_below_line: int | None = None
+    tic_above_line: int | None = None
+    error: str | None = None
+
+
 def adapt_charge_scan_result(
     analysis: charge_regions.ChargeRegionResult,
     settings: AlgorithmSettings,
@@ -297,6 +317,11 @@ def adapt_charge_scan_result(
 def analysis_error_advice(error: Exception) -> str:
     """Give the user a concrete recovery action for an analysis failure."""
     message = str(error).casefold()
+    if "acquisition m/z range" in message:
+        return (
+            "Choose another complete .d dataset whose analysis.tdf contains "
+            "MzAcqRangeLower and MzAcqRangeUpper metadata."
+        )
     if (
         "uncensored dominant" in message
         or "both dominant 1+ and 2+ cells" in message
@@ -328,8 +353,8 @@ def analysis_error_advice(error: Exception) -> str:
         )
     if isinstance(error, MemoryError):
         return (
-            "Reduce the mobility-bin count or narrow the m/z range in settings, "
-            "then retry the analysis."
+            "Reduce the mobility-bin count, or choose a dataset acquired over a "
+            "narrower m/z range, then retry the analysis."
         )
     if isinstance(error, ValueError):
         return (
@@ -454,57 +479,201 @@ def dominant_charge_text(
     return output
 
 
-def _compact_count(value: int) -> str:
-    for divisor, suffix in ((1_000_000_000, "G"), (1_000_000, "M"), (1_000, "k")):
-        if value >= divisor:
-            return f"{value / divisor:.1f}{suffix}"
-    return str(value)
+def dominant_charge_svg(result: ChargeScanResult) -> str:
+    """Build a scalable, full-grid dominant-charge view with its separator."""
+    charge_planes = result.intensities
+    maxima = charge_planes.max(axis=0)
+    dominant = 3 - np.argmax(charge_planes[::-1], axis=0)
+    dominant = np.where(maxima == 0, 0, dominant).astype(np.uint8)
+    logged = np.log1p(maxima)
+    positive = logged[logged > 0]
+    scale = float(np.quantile(positive, 0.99)) if positive.size else 1.0
+
+    width, height = 1600, 1000
+    left, top, plot_width, plot_height = 100, 70, 1260, 820
+    rows, columns = maxima.shape
+    cell_width = plot_width / columns
+    cell_height = plot_height / rows
+    colours = {1: "#4c78a8", 2: "#f58518", 3: "#54a24b"}
+    elements = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        (
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
+            f'height="{height}" viewBox="0 0 {width} {height}">'
+        ),
+        '<rect width="100%" height="100%" fill="#0d1117"/>',
+        '<defs><clipPath id="plot"><rect x="100" y="70" '
+        'width="1260" height="820"/></clipPath></defs>',
+        '<g clip-path="url(#plot)">',
+        (
+            f'<rect x="{left}" y="{top}" width="{plot_width}" '
+            f'height="{plot_height}" fill="#161b22"/>'
+        ),
+    ]
+    for row in range(rows):
+        svg_y = top + (rows - row - 1) * cell_height
+        for column in range(columns):
+            charge = int(dominant[row, column])
+            if charge == 0:
+                continue
+            opacity = 0.18 + 0.82 * min(
+                1.0, float(logged[row, column]) / max(scale, 1.0)
+            )
+            elements.append(
+                f'<rect x="{left + column * cell_width:.3f}" '
+                f'y="{svg_y:.3f}" width="{cell_width + 0.04:.3f}" '
+                f'height="{cell_height + 0.04:.3f}" '
+                f'fill="{colours[charge]}" opacity="{opacity:.3f}"/>'
+            )
+
+    line = result.line_data.get("line")
+    if isinstance(line, dict):
+        try:
+            intercept = float(line["intercept"])
+            slope = float(line["slope"])
+        except (KeyError, TypeError, ValueError):
+            pass
+        else:
+            mobility_min = float(result.mobility_edges[0])
+            mobility_max = float(result.mobility_edges[-1])
+            mz_min = float(result.mz_edges[0])
+            mz_max = float(result.mz_edges[-1])
+
+            def svg_y(mz: float) -> float:
+                mobility = intercept + slope * mz
+                return top + (
+                    (mobility_max - mobility)
+                    / (mobility_max - mobility_min)
+                    * plot_height
+                )
+
+            elements.append(
+                f'<line x1="{left}" y1="{svg_y(mz_min):.3f}" '
+                f'x2="{left + plot_width}" y2="{svg_y(mz_max):.3f}" '
+                'stroke="#ffffff" stroke-width="4"/>'
+            )
+    elements.extend(
+        [
+            "</g>",
+            (
+                f'<rect x="{left}" y="{top}" width="{plot_width}" '
+                f'height="{plot_height}" fill="none" stroke="#8b949e" '
+                'stroke-width="2"/>'
+            ),
+            '<text x="800" y="38" fill="#f0f6fc" font-size="28" '
+            'text-anchor="middle" font-family="monospace">'
+            "Dominant charge and fitted 1+/multicharge separator</text>",
+            (
+                f'<text x="{left}" y="930" fill="#c9d1d9" font-size="22" '
+                f'font-family="monospace">{result.mz_edges[0]:g}</text>'
+            ),
+            (
+                f'<text x="{left + plot_width}" y="930" fill="#c9d1d9" '
+                f'font-size="22" text-anchor="end" font-family="monospace">'
+                f'{result.mz_edges[-1]:g}</text>'
+            ),
+            '<text x="730" y="965" fill="#c9d1d9" font-size="24" '
+            'text-anchor="middle" font-family="monospace">m/z</text>',
+            (
+                f'<text x="82" y="{top + plot_height}" fill="#c9d1d9" '
+                f'font-size="20" text-anchor="end" font-family="monospace">'
+                f'{result.mobility_edges[0]:.3f}</text>'
+            ),
+            (
+                f'<text x="82" y="{top + 18}" fill="#c9d1d9" '
+                f'font-size="20" text-anchor="end" font-family="monospace">'
+                f'{result.mobility_edges[-1]:.3f}</text>'
+            ),
+            '<text x="32" y="480" fill="#c9d1d9" font-size="24" '
+            'text-anchor="middle" font-family="monospace" '
+            'transform="rotate(-90 32 480)">inverse ion mobility (1/K0)</text>',
+            '<rect x="1400" y="160" width="28" height="28" fill="#4c78a8"/>',
+            '<text x="1440" y="183" fill="#f0f6fc" font-size="22" '
+            'font-family="monospace">charge 1</text>',
+            '<rect x="1400" y="210" width="28" height="28" fill="#f58518"/>',
+            '<text x="1440" y="233" fill="#f0f6fc" font-size="22" '
+            'font-family="monospace">charge 2</text>',
+            '<rect x="1400" y="260" width="28" height="28" fill="#54a24b"/>',
+            '<text x="1440" y="283" fill="#f0f6fc" font-size="22" '
+            'font-family="monospace">charge 3</text>',
+            '<line x1="1400" y1="330" x2="1428" y2="330" '
+            'stroke="#ffffff" stroke-width="4"/>',
+            '<text x="1440" y="338" fill="#f0f6fc" font-size="22" '
+            'font-family="monospace">separator</text>',
+            "</svg>",
+        ]
+    )
+    return "\n".join(elements) + "\n"
+
+
+def write_dominant_charge_svg(
+    result: ChargeScanResult, directory: Path
+) -> Path:
+    """Atomically create a uniquely named SVG for browser viewing."""
+    directory.mkdir(parents=True, exist_ok=True)
+    descriptor, name = tempfile.mkstemp(
+        prefix="dominant-charge-", suffix=".svg", dir=directory, text=True
+    )
+    with os.fdopen(descriptor, "w") as handle:
+        handle.write(dominant_charge_svg(result))
+        handle.flush()
+        os.fsync(handle.fileno())
+    return Path(name)
 
 
 def event_histogram_text(
     result: ChargeScanResult, width: int, height: int
 ) -> Text:
-    """Render grouped raw-event counts as log-scaled horizontal ASCII bars."""
-    available_rows = max(2, min(height - 2, 24))
-    normal_rows = max(1, available_rows - 1)
-    edges = np.linspace(0, 127, normal_rows + 1, dtype=int)
-    groups: list[tuple[str, int, bool]] = []
-    for index in range(normal_rows):
-        start = int(edges[index])
-        stop = int(edges[index + 1])
-        low_intensity = start + 1
-        high_intensity = stop
-        label = (
-            str(low_intensity)
-            if low_intensity == high_intensity
-            else f"{low_intensity}-{high_intensity}"
-        )
-        count = int(result.histogram[start:stop].sum(dtype=np.uint64))
-        contains_threshold = low_intensity <= result.settings.min_intensity <= high_intensity
-        groups.append((label, count, contains_threshold))
-    groups.append((">=128", int(result.histogram[127]), result.settings.min_intensity >= 128))
-
-    maximum_log = max(np.log1p(count) for _, count, _ in groups)
-    label_width = max(len(label) for label, _, _ in groups) + 1
-    bar_width = max(4, width - label_width - 12)
+    """Render a compact vertical log histogram, retaining one or two bins."""
+    available_columns = max(8, width - 8)
+    if available_columns >= 128:
+        group_size = 1
+    elif available_columns >= 64:
+        group_size = 2
+    else:
+        group_size = int(np.ceil(128 / available_columns))
+    grouped = np.array(
+        [
+            result.histogram[start : min(start + group_size, 128)].sum(
+                dtype=np.uint64
+            )
+            for start in range(0, 128, group_size)
+        ],
+        dtype=np.uint64,
+    )
+    logarithms = np.log1p(grouped.astype(np.float64))
+    maximum = float(logarithms.max()) if logarithms.size else 0.0
+    plot_rows = max(4, min(height - 4, 10))
+    heights = (
+        np.zeros(grouped.size, dtype=int)
+        if maximum == 0
+        else np.rint(logarithms / maximum * plot_rows).astype(int)
+    )
+    threshold_bin = min(
+        127, max(0, int(np.ceil(result.settings.min_intensity)) - 1)
+    )
+    threshold_column = threshold_bin // group_size
     output = Text(no_wrap=True)
     output.append(
-        f"raw MS1 events · log bars · minimum={result.settings.min_intensity:g} (*)",
+        "raw MS1 events · log count · "
+        f"{group_size} intensity bin{'s' if group_size > 1 else ''}/column · "
+        f"minimum={result.settings.min_intensity:g} (*)",
         style="bold",
     )
     output.append(chr(10))
-    for label, count, contains_threshold in groups:
-        length = (
-            0
-            if count == 0 or maximum_log == 0
-            else max(1, round(np.log1p(count) / maximum_log * bar_width))
-        )
-        marker = "*" if contains_threshold else " "
-        output.append(f"{label:>{label_width}}{marker}|", style="dim")
-        output.append("#" * length, style="bold #4c78a8")
-        output.append(" " * (bar_width - length))
-        output.append(f" {_compact_count(count):>8}")
+    for row in range(plot_rows, 0, -1):
+        output.append("  |", style="dim")
+        for column, bar_height in enumerate(heights):
+            character = "#" if bar_height >= row else " "
+            style = "bold #f2cc60" if column == threshold_column else "bold #4c78a8"
+            output.append(character, style=style)
         output.append(chr(10))
+    output.append("  +" + "-" * grouped.size, style="dim")
+    output.append(chr(10))
+    output.append(
+        f"   1{' ' * max(1, grouped.size - 6)}>=128",
+        style="dim",
+    )
     return output
 
 
@@ -633,37 +802,107 @@ def format_size(size: int | None) -> str:
     return f"{value:.1f} PiB"
 
 
-def _read_dataset_description(
-    dataset_path: Path,
-) -> tuple[str | None, str | None]:
-    """Return a Description and a diagnostic without modifying analysis.tdf."""
+def _read_dataset_metadata(dataset_path: Path) -> DatasetMetadata:
+    """Read and validate cached metadata through one read-only connection."""
     database = dataset_path / "analysis.tdf"
+    analysis_tdf_size = _file_size(database)
+    analysis_tdf_bin_size = _file_size(dataset_path / "analysis.tdf_bin")
+
+    def unavailable(error: str) -> DatasetMetadata:
+        return DatasetMetadata(
+            description=None,
+            description_error=error,
+            mz_acquisition_min=None,
+            mz_acquisition_max=None,
+            mz_acquisition_error=error,
+            gradient_length_seconds=None,
+            gradient_length_error=error,
+            analysis_tdf_size=analysis_tdf_size,
+            analysis_tdf_bin_size=analysis_tdf_bin_size,
+        )
+
     if not database.is_file():
-        return None, "analysis.tdf not found"
+        return unavailable("analysis.tdf not found")
     try:
         uri = f"{database.resolve(strict=True).as_uri()}?mode=ro"
         with sqlite3.connect(uri, uri=True, timeout=1.0) as connection:
-            row = connection.execute(
-                "SELECT \"Value\" FROM \"GlobalMetadata\" "
-                "WHERE \"Key\" = ? LIMIT 1",
-                ("Description",),
-            ).fetchone()
+            rows = connection.execute(
+                "SELECT \"Key\", \"Value\" FROM \"GlobalMetadata\" "
+                "WHERE \"Key\" IN (?, ?, ?)",
+                ("Description", "MzAcqRangeLower", "MzAcqRangeUpper"),
+            ).fetchall()
+            try:
+                gradient_row = connection.execute(
+                    'SELECT MAX("Time") - MIN("Time") FROM "Frames"'
+                ).fetchone()
+            except sqlite3.Error as error:
+                raw_gradient_length = None
+                gradient_error = f"Frames.Time SQLite error: {error}"
+            else:
+                raw_gradient_length = (
+                    gradient_row[0] if gradient_row is not None else None
+                )
+                gradient_error = None
     except OSError as error:
-        return None, f"filesystem error: {error}"
+        return unavailable(f"filesystem error: {error}")
     except sqlite3.Error as error:
-        return None, f"SQLite error: {error}"
-    if row is None or row[0] is None:
-        return None, "GlobalMetadata.Description not found"
-    description = str(row[0]).strip()
-    if not description:
-        return None, "GlobalMetadata.Description is empty"
-    return description, None
+        return unavailable(f"SQLite error: {error}")
+
+    values = {str(key): value for key, value in rows}
+    raw_description = values.get("Description")
+    description = (
+        str(raw_description).strip() if raw_description is not None else None
+    )
+    if raw_description is None:
+        description_error = "GlobalMetadata.Description not found"
+    elif not description:
+        description_error = "GlobalMetadata.Description is empty"
+        description = None
+    else:
+        description_error = None
+
+    raw_mz_min = values.get("MzAcqRangeLower")
+    raw_mz_max = values.get("MzAcqRangeUpper")
+    try:
+        mz_min = float(raw_mz_min)
+        mz_max = float(raw_mz_max)
+    except (TypeError, ValueError):
+        mz_min = mz_max = None
+        mz_error = "GlobalMetadata acquisition m/z range not found"
+    else:
+        if not np.isfinite(mz_min) or not np.isfinite(mz_max) or mz_min >= mz_max:
+            mz_min = mz_max = None
+            mz_error = "GlobalMetadata acquisition m/z range is invalid"
+        else:
+            mz_error = None
+
+    try:
+        gradient_length = float(raw_gradient_length)
+    except (TypeError, ValueError):
+        gradient_length = None
+        if gradient_error is None:
+            gradient_error = "Frames.Time retention span not found"
+    else:
+        if not np.isfinite(gradient_length) or gradient_length < 0:
+            gradient_length = None
+            gradient_error = "Frames.Time retention span is invalid"
+
+    return DatasetMetadata(
+        description=description,
+        description_error=description_error,
+        mz_acquisition_min=mz_min,
+        mz_acquisition_max=mz_max,
+        mz_acquisition_error=mz_error,
+        gradient_length_seconds=gradient_length,
+        gradient_length_error=gradient_error,
+        analysis_tdf_size=analysis_tdf_size,
+        analysis_tdf_bin_size=analysis_tdf_bin_size,
+    )
 
 
 def read_dataset_description(dataset_path: Path) -> str | None:
     """Read a dataset Description from analysis.tdf without modifying it."""
-    description, _ = _read_dataset_description(dataset_path)
-    return description
+    return _read_dataset_metadata(dataset_path).description
 
 
 def _dataset_has_analysis_pair(dataset_path: Path) -> bool:
@@ -681,17 +920,6 @@ def _file_size(path: Path) -> int | None:
         return None
 
 
-def _read_dataset_metadata(dataset_path: Path) -> DatasetMetadata:
-    """Read the Description once and stat the two standard analysis files."""
-    description, description_error = _read_dataset_description(dataset_path)
-    return DatasetMetadata(
-        description=description,
-        description_error=description_error,
-        analysis_tdf_size=_file_size(dataset_path / "analysis.tdf"),
-        analysis_tdf_bin_size=_file_size(dataset_path / "analysis.tdf_bin"),
-    )
-
-
 def _dataset_metadata_text(
     dataset_path: Path, metadata: DatasetMetadata
 ) -> Text:
@@ -707,11 +935,63 @@ def _dataset_metadata_text(
             f"unavailable ({metadata.description_error or 'unknown error'})",
             style="italic #ff7b72",
         )
+    output.append("\nAcquisition m/z   ", style="dim")
+    if metadata.mz_acquisition_error is None:
+        output.append(_acquisition_mz_text(metadata), style="#f2cc60")
+    else:
+        output.append(
+            f"unavailable ({metadata.mz_acquisition_error or 'unknown error'})",
+            style="italic #ff7b72",
+        )
+    output.append("\nGradient length   ", style="dim")
+    if metadata.gradient_length_error is None:
+        output.append(_gradient_length_text(metadata), style="#54a24b")
+    else:
+        output.append(
+            f"unavailable ({metadata.gradient_length_error or 'unknown error'})",
+            style="italic #ff7b72",
+        )
     output.append("\nanalysis.tdf      ", style="dim")
     output.append(format_size(metadata.analysis_tdf_size), style="#8be9fd")
     output.append("\nanalysis.tdf_bin  ", style="dim")
     output.append(format_size(metadata.analysis_tdf_bin_size), style="#8be9fd")
     return output
+
+
+def _acquisition_mz_text(metadata: DatasetMetadata) -> str:
+    """Format a previously validated acquisition range."""
+    if (
+        metadata.mz_acquisition_min is None
+        or metadata.mz_acquisition_max is None
+    ):
+        return "unavailable"
+    return f"{metadata.mz_acquisition_min:g} – {metadata.mz_acquisition_max:g}"
+
+
+def _gradient_length_text(metadata: DatasetMetadata) -> str:
+    """Format the cached Frames.Time span as hours, minutes, and seconds."""
+    if metadata.gradient_length_seconds is None:
+        return "unavailable"
+    total_seconds = max(0, int(round(metadata.gradient_length_seconds)))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours}h{minutes:02d}m{seconds:02d}s"
+
+
+def _column_cell(value: str, width: int) -> str:
+    """Pad or ellipsize a string to an exact terminal-cell column width."""
+    if len(value) > width:
+        return value[: max(0, width - 1)] + "…"
+    return value.ljust(width)
+
+
+def _column_width(
+    values: Iterable[str], *, minimum: int, maximum: int | None = None
+) -> int:
+    """Choose one stable width for a collection of row values."""
+    width = max((len(value) for value in values), default=minimum)
+    width = max(minimum, width)
+    return min(width, maximum) if maximum is not None else width
 
 
 def _matches_name_filter(name: str, pattern: str | None) -> bool:
@@ -721,22 +1001,54 @@ def _matches_name_filter(name: str, pattern: str | None) -> bool:
     return fnmatch.fnmatchcase(name.casefold(), pattern.casefold())
 
 
-def _entry_label(entry: FileEntry, *, marked: bool = False) -> Text:
+def _entry_label(
+    entry: FileEntry,
+    *,
+    marked: bool = False,
+    metadata: DatasetMetadata | None = None,
+    name_width: int | None = None,
+) -> Text:
     label = Text(no_wrap=True, overflow="ellipsis")
     if entry.is_dir:
         label.append(
             "✓ " if marked else "▸ ",
             style="bold green" if marked else "bold cyan",
         )
-        label.append(entry.name, style="bold cyan")
-        label.append("/", style="cyan")
+        directory_name = f"{entry.name}/"
+        label.append(
+            _column_cell(directory_name, name_width)
+            if name_width is not None
+            else directory_name,
+            style="bold cyan",
+        )
     elif entry.is_symlink:
         label.append("↗ ", style="magenta")
-        label.append(entry.name, style="magenta")
-        label.append("@", style="dim magenta")
+        symlink_name = f"{entry.name}@"
+        label.append(
+            _column_cell(symlink_name, name_width)
+            if name_width is not None
+            else symlink_name,
+            style="magenta",
+        )
     else:
         label.append("  ")
-        label.append(entry.name)
+        label.append(
+            _column_cell(entry.name, name_width)
+            if name_width is not None
+            else entry.name
+        )
+    if name_width is not None:
+        label.append(" │ ", style="dim")
+        if entry.is_dir and entry.name.casefold().endswith(".d"):
+            label.append("Gradient ", style="dim italic")
+            if metadata is None:
+                label.append("…", style="dim")
+            elif metadata.gradient_length_error is None:
+                label.append(
+                    _gradient_length_text(metadata), style="bold #54a24b"
+                )
+            else:
+                label.append("unavailable", style="italic #ff7b72")
     return label
 
 
@@ -830,6 +1142,63 @@ class SelectedOptionList(OptionList):
         await super()._on_click(event)
 
 
+def _selected_description(
+    description: str | None, description_error: str | None
+) -> str:
+    """Return the display text for a cached dataset Description."""
+    return description or f"unavailable ({description_error or 'unknown error'})"
+
+
+def _relative_tic(value: int, reference: int | None, *, chosen: bool) -> str:
+    """Format a TIC value relative to the chosen HeLa reference."""
+    if chosen and reference is not None:
+        return "100.0%"
+    if reference is None or reference == 0:
+        return "n/a"
+    return f"{100.0 * value / reference:.1f}%"
+
+
+def _selected_tic_cells(
+    tic_state: DatasetTicState | None,
+    hela_tic_state: DatasetTicState | None,
+    *,
+    chosen: bool,
+) -> tuple[str, str]:
+    """Return stable below/above column values for one selected dataset."""
+    if tic_state is None:
+        return "—", "—"
+    if tic_state.status in {"queued", "running"}:
+        value = f"{tic_state.status}…"
+        return value, value
+    if tic_state.status == "error":
+        return "ERROR", "ERROR"
+    if (
+        tic_state.tic_below_line is None
+        or tic_state.tic_above_line is None
+    ):
+        return "—", "—"
+    below_reference = (
+        hela_tic_state.tic_below_line
+        if hela_tic_state is not None
+        else None
+    )
+    above_reference = (
+        hela_tic_state.tic_above_line
+        if hela_tic_state is not None
+        else None
+    )
+    below_relative = _relative_tic(
+        tic_state.tic_below_line, below_reference, chosen=chosen
+    )
+    above_relative = _relative_tic(
+        tic_state.tic_above_line, above_reference, chosen=chosen
+    )
+    return (
+        f"{tic_state.tic_below_line:,} ({below_relative} HeLa)",
+        f"{tic_state.tic_above_line:,} ({above_relative} HeLa)",
+    )
+
+
 def _selected_path_label(
     path: Path,
     root: Path,
@@ -838,7 +1207,19 @@ def _selected_path_label(
     chosen: bool,
     description: str | None,
     description_error: str | None,
+    fitted_line: tuple[float, float] | None,
+    tic_state: DatasetTicState | None,
+    hela_tic_state: DatasetTicState | None,
+    path_width: int,
+    description_width: int,
+    below_width: int,
+    above_width: int,
 ) -> Text:
+    relative_path = str(path.relative_to(root))
+    description_text = _selected_description(description, description_error)
+    below_text, above_text = _selected_tic_cells(
+        tic_state, hela_tic_state, chosen=chosen
+    )
     label = Text(no_wrap=True, overflow="ellipsis")
     label.append(
         " × ",
@@ -850,15 +1231,27 @@ def _selected_path_label(
     )
     label.append("★ " if chosen else "  ", style="bold yellow" if chosen else "dim")
     label.append(
-        str(path.relative_to(root)),
+        _column_cell(relative_path, path_width),
         style="bold yellow" if chosen else "#c9d1d9",
     )
-    label.append("  │  ", style="dim")
-    label.append("Description: ", style="dim italic")
+    label.append(" │ ", style="dim")
     label.append(
-        description or f"unavailable ({description_error or 'unknown error'})",
+        _column_cell(description_text, description_width),
         style="bold yellow" if chosen else "italic #8b949e",
     )
+    label.append(" │ Below ", style="dim italic")
+    tic_style = "bold #ff7b72" if below_text == "ERROR" else "bold #8be9fd"
+    label.append(_column_cell(below_text, below_width), style=tic_style)
+    label.append(" │ Above ", style="dim italic")
+    tic_style = "bold #ff7b72" if above_text == "ERROR" else "bold #8be9fd"
+    label.append(_column_cell(above_text, above_width), style=tic_style)
+    if fitted_line is not None:
+        intercept, slope = fitted_line
+        label.append(" │ Fit ", style="dim italic")
+        label.append(
+            f"1/K0 = {intercept:.6g} {slope:+.6g}×m/z",
+            style="bold #f2cc60",
+        )
     if chosen:
         label.stylize("on #3d3200")
     return label
@@ -899,20 +1292,44 @@ class AnalysisPlot(Static):
         self.update(rendered)
 
 
-class ChargeScanScreen(ModalScreen[bool]):
-    """Confirm an intentionally expensive charge-region analysis."""
+def fit_parameters_text(result: ChargeScanResult) -> Text:
+    """Render only the accepted separator equation and its fitted parameters."""
+    line = result.line_data.get("line")
+    output = Text()
+    if not isinstance(line, dict):
+        return Text("Fitted line parameters are unavailable.", style="bold red")
+    try:
+        intercept = float(line["intercept"])
+        slope = float(line["slope"])
+    except (KeyError, TypeError, ValueError):
+        return Text("Fitted line parameters are invalid.", style="bold red")
+    output.append("Fitted 1+/multicharge separator\n\n", style="bold #8be9fd")
+    output.append("1/K0 = intercept + slope × m/z\n\n", style="bold #f0f6fc")
+    output.append("intercept  ", style="dim")
+    output.append(f"{intercept:.12g}\n", style="bold #f2cc60")
+    output.append("slope      ", style="dim")
+    output.append(f"{slope:.12g}", style="bold #f2cc60")
+    return output
+
+
+class ChargeScanScreen(ModalScreen[ChargeScanResult | None]):
+    """Confirm, run, and review one charge-region fit in a large modal."""
+
+    class ScanRequested(Message):
+        def __init__(self, screen: ChargeScanScreen) -> None:
+            super().__init__()
+            self.screen = screen
 
     CSS = """
     ChargeScanScreen {
         align: center middle;
-        background: #000000 70%;
+        background: #000000 78%;
     }
 
     #scan-dialog {
-        width: 82;
-        max-width: 95%;
-        height: 17;
-        padding: 1 2;
+        width: 98%;
+        height: 96%;
+        padding: 1;
         border: round #f2cc60;
         background: #161b22;
     }
@@ -926,6 +1343,42 @@ class ChargeScanScreen(ModalScreen[bool]):
 
     #scan-question {
         height: 1fr;
+        padding: 1 3;
+    }
+
+    #scan-loading {
+        display: none;
+        height: 1fr;
+        content-align: center middle;
+        color: #f2cc60;
+        text-style: bold;
+    }
+
+    #scan-tabs {
+        display: none;
+        height: 1fr;
+    }
+
+    #scan-tabs TabPane {
+        height: 1fr;
+        padding: 0 1;
+        overflow: hidden;
+    }
+
+    #scan-fit-parameters {
+        height: 1fr;
+        padding: 2 4;
+        content-align: center middle;
+    }
+
+    #scan-histogram-plot {
+        height: 16;
+        content-align: center middle;
+    }
+
+    #scan-dominant-plot {
+        height: 1fr;
+        content-align: center middle;
     }
 
     #scan-buttons {
@@ -934,8 +1387,12 @@ class ChargeScanScreen(ModalScreen[bool]):
     }
 
     #scan-buttons Button {
-        width: 14;
+        width: 18;
         margin-left: 1;
+    }
+
+    #scan-svg {
+        display: none;
     }
     """
 
@@ -949,18 +1406,25 @@ class ChargeScanScreen(ModalScreen[bool]):
         dataset: Path,
         *,
         settings: AlgorithmSettings,
+        metadata: DatasetMetadata,
     ) -> None:
         super().__init__()
         self.dataset = dataset
         self.settings = settings
+        self.metadata = metadata
+        self.state = "confirm"
+        self.result: ChargeScanResult | None = None
+        self.svg_url: str | None = None
+        self._loading_step = 0
 
     def compose(self) -> ComposeResult:
         question = (
             f"HeLa: {self.dataset}\n\n"
             "The scan can take a while and will run in a worker thread.\n"
             "Results stay in memory; no analysis artifacts will be written.\n\n"
+            f"comparison m/z={self.settings.mz_min:g}–{self.settings.mz_max:g}, "
+            f"dataset acquisition m/z={_acquisition_mz_text(self.metadata)}\n"
             f"isotopes={self.settings.isotope_count}, "
-            f"m/z={self.settings.mz_min:g}-{self.settings.mz_max:g}, "
             f"bin={self.settings.mz_bin_width:g}, "
             f"minimum={self.settings.min_intensity:g}, "
             f"stride={self.settings.frame_stride}"
@@ -968,21 +1432,107 @@ class ChargeScanScreen(ModalScreen[bool]):
         with Container(id="scan-dialog"):
             yield Static("Scan this folder for charge areas?", id="scan-title")
             yield Static(question, id="scan-question", markup=False)
+            yield Static(id="scan-loading", markup=False)
+            with TabbedContent(initial="scan-dominant", id="scan-tabs"):
+                with TabPane("Dominant + border", id="scan-dominant"):
+                    yield AnalysisPlot("dominant", id="scan-dominant-plot")
+                with TabPane("Event histogram", id="scan-histogram"):
+                    yield AnalysisPlot("histogram", id="scan-histogram-plot")
+                with TabPane("Fit parameters", id="scan-fit"):
+                    yield Static(id="scan-fit-parameters", markup=False)
             with Horizontal(id="scan-buttons"):
-                yield Button("No", id="scan-no")
-                yield Button("Yes, scan", id="scan-yes", variant="primary")
+                yield Button("Open hi-res SVG", id="scan-svg")
+                yield Button("Reject", id="scan-no", variant="error")
+                yield Button("Calculate", id="scan-yes", variant="primary")
 
     def on_mount(self) -> None:
         self.query_one("#scan-no", Button).focus()
+        self._loading_timer = self.set_interval(
+            0.4, self._animate_loading, pause=True
+        )
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        self.dismiss(event.button.id == "scan-yes")
+        if event.button.id == "scan-svg":
+            if self.svg_url is not None:
+                self.app.open_url(self.svg_url, new_tab=True)
+            return
+        if event.button.id == "scan-no":
+            self.action_decline()
+        elif event.button.id == "scan-yes":
+            self.action_confirm()
 
     def action_decline(self) -> None:
-        self.dismiss(False)
+        if self.state != "loading":
+            self.dismiss(None)
 
     def action_confirm(self) -> None:
-        self.dismiss(True)
+        if self.state == "confirm":
+            self.show_loading()
+            self.post_message(self.ScanRequested(self))
+        elif self.state == "review" and self.result is not None:
+            self.dismiss(self.result)
+
+    def show_loading(self) -> None:
+        self.state = "loading"
+        self.query_one("#scan-question", Static).styles.display = "none"
+        self.query_one("#scan-loading", Static).styles.display = "block"
+        self.query_one("#scan-yes", Button).disabled = True
+        self.query_one("#scan-no", Button).disabled = True
+        self._loading_timer.resume()
+        self.set_progress("calling tickyticker.analyse() directly")
+
+    def _animate_loading(self) -> None:
+        if self.state != "loading":
+            return
+        self._loading_step = (self._loading_step + 1) % 4
+        current = str(self.query_one("#scan-loading", Static).render()).split(
+            "\n", 1
+        )[-1]
+        self.query_one("#scan-loading", Static).update(
+            f"loading charge areas{'.' * self._loading_step}\n{current}"
+        )
+
+    def set_progress(self, progress: str) -> None:
+        self.query_one("#scan-loading", Static).update(
+            f"loading charge areas{'.' * self._loading_step}\n{progress}"
+        )
+
+    def show_result(
+        self, result: ChargeScanResult, svg_url: str | None
+    ) -> None:
+        self.state = "review"
+        self.result = result
+        self.svg_url = svg_url
+        self._loading_timer.pause()
+        self.query_one("#scan-loading", Static).styles.display = "none"
+        tabs = self.query_one("#scan-tabs", TabbedContent)
+        tabs.styles.display = "block"
+        tabs.active = "scan-dominant"
+        self.query_one("#scan-dominant-plot", AnalysisPlot).show_result(result)
+        self.query_one("#scan-histogram-plot", AnalysisPlot).show_result(result)
+        self.query_one("#scan-fit-parameters", Static).update(
+            fit_parameters_text(result)
+        )
+        self.query_one("#scan-title", Static).update(
+            "Review the fitted 1+/multicharge separator"
+        )
+        svg_button = self.query_one("#scan-svg", Button)
+        svg_button.styles.display = "block"
+        svg_button.disabled = svg_url is None
+        if svg_url is None:
+            svg_button.label = "SVG unavailable"
+        reject = self.query_one("#scan-no", Button)
+        accept = self.query_one("#scan-yes", Button)
+        reject.disabled = False
+        accept.disabled = False
+        reject.label = "Reject"
+        accept.label = "Accept fit"
+        accept.variant = "success"
+        accept.focus()
+
+    def reject_after_error(self) -> None:
+        self._loading_timer.pause()
+        self.dismiss(None)
 
 
 class AnalysisErrorScreen(ModalScreen[None]):
@@ -1067,16 +1617,19 @@ class AnalysisErrorScreen(ModalScreen[None]):
         error: str,
         traceback_text: str,
         advice: str,
+        *,
+        title: str = "CHARGE-AREA ANALYSIS FAILED",
     ) -> None:
         super().__init__()
         self.dataset = dataset
         self.error = error
         self.traceback_text = traceback_text
         self.advice = advice
+        self.error_title = title
 
     def compose(self) -> ComposeResult:
         with Container(id="analysis-error-dialog"):
-            yield Static("CHARGE-AREA ANALYSIS FAILED", id="analysis-error-title")
+            yield Static(self.error_title, id="analysis-error-title")
             yield Static(
                 f"Dataset: {self.dataset}\n{self.error}",
                 id="analysis-error-summary",
@@ -1189,7 +1742,13 @@ class SettingsScreen(ModalScreen[AlgorithmSettings | None]):
         )
         with Container(id="settings-dialog"):
             yield Static("charge-regions settings", id="settings-title")
-            yield Static(f"TOML: {path_text}", id="settings-path", markup=False)
+            yield Static(
+                f"TOML: {path_text}\n"
+                "Comparison m/z bounds apply to every fit and TIC pass; "
+                "dataset acquisition bounds are shown separately.",
+                id="settings-path",
+                markup=False,
+            )
             with VerticalScroll(id="settings-fields"):
                 for name, label, value_type in SETTING_DEFINITIONS:
                     with Horizontal(classes="setting-row"):
@@ -1207,7 +1766,7 @@ class SettingsScreen(ModalScreen[AlgorithmSettings | None]):
                 yield Button("Save", id="settings-save", variant="primary")
 
     def on_mount(self) -> None:
-        self.query_one("#setting-isotope_count", Input).focus()
+        self.query_one("#setting-mz_min", Input).focus()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "settings-save":
@@ -1380,24 +1939,30 @@ class HelpScreen(ModalScreen[None]):
   s                 edit charge-regions algorithm settings
 
 [b].d datasets[/b]
-  Preview           for a complete .d, show Description and human-readable
-                    analysis.tdf / analysis.tdf_bin sizes instead of contents
+  Current row       show cached gradient length; columns remain aligned
+  Preview           for a complete .d, show Description, acquisition m/z range,
+                    gradient length, and analysis file sizes instead of contents
   Space             add highlighted .d folder to :selected:, read its
                     cached Description, then move down
   Ctrl+Down         move focus to :selected:
   Ctrl+Up           return focus to the filesystem pane
   Click             focus a row in :selected:
-  Selected row      root-relative path and Description on one line
+  Selected row      aligned path | Description | Below | Above | optional Fit
   j/k or arrows     move through selected paths
   g/G               jump to first/last selected path
-  Space             toggle the current path as HeLa
-                    Choosing HeLa opens a charge-area scan prompt
-  y / Yes, scan     call tickyticker directly in the background; show
-                    below as an ASCII dominant-charge map with border,
-                    an ASCII histogram, and charge-border model data
-  n / No            keep HeLa chosen without starting a scan
+  Space             choose a path as HeLa and open the fit-review popup
+  Calculate         fit in the popup, then review dominant-charge map,
+                    compact histogram, curve parameters, and hi-res SVG
+  Accept fit        run thresholded below/above TIC for every selected path
+                    and report each value plus its percentage of HeLa
+  Reject            return with all selected paths preserved and no chosen HeLa
   x or click ×      remove the current path
   h                 return focus to the middle pane
+
+[b]Analysis settings[/b]
+  m/z min/max       primary comparison window used for every dataset
+  Acquisition m/z   read per dataset from GlobalMetadata and shown as context
+  s                 edit and save algorithm settings
 
 Shift+H opens this help. Escape or Close dismisses it. q quits."""
 
@@ -1482,43 +2047,6 @@ class FileViewerApp(App[None]):
         padding: 0;
     }
 
-    #analysis-pane {
-        display: none;
-        height: 2fr;
-        min-height: 12;
-        padding: 0;
-    }
-
-    #analysis-loading {
-        height: 1fr;
-        padding: 1 2;
-        color: #f2cc60;
-        text-style: bold;
-    }
-
-    #analysis-tabs {
-        display: none;
-        height: 1fr;
-    }
-
-    #analysis-tabs TabPane {
-        height: 1fr;
-        padding: 0 1;
-        overflow: hidden;
-    }
-
-    #analysis-data {
-        height: 1fr;
-        overflow-y: auto;
-        padding: 0 1;
-    }
-
-    AnalysisPlot {
-        height: 1fr;
-        content-align: center middle;
-        overflow: hidden;
-    }
-
     #status-bar {
         height: 1;
         padding: 0 1;
@@ -1566,6 +2094,8 @@ class FileViewerApp(App[None]):
         *,
         show_hidden: bool = False,
         settings_path: str | os.PathLike[str] | None = None,
+        plot_directory: str | os.PathLike[str] = "/tmp/tickyticker/plots",
+        plot_base_url: str | None = None,
     ):
         super().__init__()
         self.navigator = FileSystemNavigator(root, show_hidden=show_hidden)
@@ -1577,6 +2107,11 @@ class FileViewerApp(App[None]):
         self.selected_descriptions: dict[Path, str | None] = {}
         self.selected_description_errors: dict[Path, str | None] = {}
         self.chosen_path: Path | None = None
+        self.accepted_fit: ChargeScanResult | None = None
+        self.tic_states: dict[Path, DatasetTicState] = {}
+        self._tic_running = False
+        self.plot_directory = Path(plot_directory).expanduser()
+        self.plot_base_url = plot_base_url.rstrip("/") if plot_base_url else None
         self.settings_path = (
             Path(settings_path).expanduser()
             if settings_path is not None
@@ -1588,9 +2123,6 @@ class FileViewerApp(App[None]):
             else AlgorithmSettings()
         )
         self._analysis_running = False
-        self._analysis_loading_text = "loading charge areas"
-        self._analysis_progress = ""
-        self._analysis_loading_step = 0
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -1600,15 +2132,6 @@ class FileViewerApp(App[None]):
             yield CurrentOptionList(id="current-pane", classes="pane", markup=False, compact=True)
             yield Static(id="preview-pane", classes="pane")
         yield SelectedOptionList(id="selected-pane", classes="pane", markup=False, compact=True)
-        with Container(id="analysis-pane", classes="pane"):
-            yield Static(id="analysis-loading", markup=False)
-            with TabbedContent(initial="analysis-dominant", id="analysis-tabs"):
-                with TabPane("Dominant + border", id="analysis-dominant"):
-                    yield AnalysisPlot("dominant", id="analysis-dominant-plot")
-                with TabPane("Event histogram", id="analysis-histogram"):
-                    yield AnalysisPlot("histogram", id="analysis-histogram-plot")
-                with TabPane("Data", id="analysis-data-tab"):
-                    yield Static(id="analysis-data", markup=False)
         yield Static(id="status-bar")
         yield Footer(compact=True)
 
@@ -1617,10 +2140,6 @@ class FileViewerApp(App[None]):
         self.query_one("#current-pane").border_title = "current"
         self.query_one("#preview-pane").border_title = "selection"
         self.query_one("#selected-pane").border_title = ":selected:"
-        self.query_one("#analysis-pane").border_title = ":charge areas:"
-        self._analysis_loading_timer = self.set_interval(
-            0.4, self._animate_analysis_loading, pause=True
-        )
         self._open_directory(self.navigator.root)
         current = self.query_one("#current-pane", CurrentOptionList)
         current.focus()
@@ -1690,6 +2209,12 @@ class FileViewerApp(App[None]):
         self._open_directory(self.navigator.parent(), highlight_name=previous_name)
 
     def action_select_dataset(self) -> None:
+        if self._tic_running:
+            self.notify(
+                "Wait for the selected-dataset TIC pass to finish",
+                severity="warning",
+            )
+            return
         selected = self.query_one("#selected-pane", SelectedOptionList)
         if selected.has_focus:
             self._toggle_chosen_path()
@@ -1732,6 +2257,9 @@ class FileViewerApp(App[None]):
         self.push_screen(HelpScreen())
 
     def action_show_settings(self) -> None:
+        if self._analysis_running or self._tic_running:
+            self.notify("Wait for the current calculation to finish", severity="warning")
+            return
         self.push_screen(
             SettingsScreen(self.algorithm_settings, self.settings_path),
             self._apply_algorithm_settings,
@@ -1815,6 +2343,43 @@ class FileViewerApp(App[None]):
         selected = self.query_one("#selected-pane", SelectedOptionList)
         if highlighted is None:
             highlighted = selected.highlighted
+        fitted_line = self._accepted_line()
+        hela_tic_state = (
+            self.tic_states.get(self.chosen_path)
+            if self.chosen_path is not None
+            else None
+        )
+        relative_paths = [
+            str(path.relative_to(self.navigator.root))
+            for path in self.selected_paths
+        ]
+        descriptions = [
+            _selected_description(
+                self.selected_descriptions.get(path),
+                self.selected_description_errors.get(path),
+            )
+            for path in self.selected_paths
+        ]
+        tic_cells = [
+            _selected_tic_cells(
+                self.tic_states.get(path),
+                hela_tic_state,
+                chosen=path == self.chosen_path,
+            )
+            for path in self.selected_paths
+        ]
+        path_width = _column_width(
+            relative_paths, minimum=16, maximum=44
+        )
+        description_width = _column_width(
+            descriptions, minimum=20, maximum=40
+        )
+        below_width = _column_width(
+            (below for below, _ in tic_cells), minimum=20
+        )
+        above_width = _column_width(
+            (above for _, above in tic_cells), minimum=20
+        )
         selected.set_options(
             [
                 _selected_path_label(
@@ -1824,6 +2389,15 @@ class FileViewerApp(App[None]):
                     chosen=path == self.chosen_path,
                     description=self.selected_descriptions.get(path),
                     description_error=self.selected_description_errors.get(path),
+                    fitted_line=(
+                        fitted_line if path == self.chosen_path else None
+                    ),
+                    tic_state=self.tic_states.get(path),
+                    hela_tic_state=hela_tic_state,
+                    path_width=path_width,
+                    description_width=description_width,
+                    below_width=below_width,
+                    above_width=above_width,
                 )
                 for index, path in enumerate(self.selected_paths)
             ]
@@ -1840,7 +2414,12 @@ class FileViewerApp(App[None]):
         for index, entry in enumerate(self.entries):
             current.replace_option_prompt_at_index(
                 index,
-                _entry_label(entry, marked=entry.path in self.selected_paths),
+                _entry_label(
+                    entry,
+                    marked=entry.path in self.selected_paths,
+                    metadata=self.dataset_metadata_cache.get(entry.path),
+                    name_width=self._current_name_column_width(),
+                ),
             )
 
     def _focus_selected(self, path: Path | None = None) -> None:
@@ -1857,13 +2436,22 @@ class FileViewerApp(App[None]):
         self._update_selected_status(selected.highlighted)
 
     def _remove_selected_at(self, index: int) -> None:
+        if self._tic_running:
+            self.notify(
+                "Wait for the selected-dataset TIC pass to finish",
+                severity="warning",
+            )
+            return
         if not 0 <= index < len(self.selected_paths):
             return
         removed = self.selected_paths.pop(index)
         self.selected_descriptions.pop(removed, None)
         self.selected_description_errors.pop(removed, None)
+        self.tic_states.pop(removed, None)
         if self.chosen_path == removed:
             self.chosen_path = None
+            self.accepted_fit = None
+            self.tic_states.clear()
         next_index = min(index, len(self.selected_paths) - 1) if self.selected_paths else None
         self._refresh_selected_pane(highlighted=next_index)
         self._refresh_current_marks()
@@ -1879,65 +2467,57 @@ class FileViewerApp(App[None]):
         choosing = self.chosen_path != path
         if choosing:
             self.chosen_path = path
+            self.accepted_fit = None
+            self.tic_states.clear()
             message = ":HELA CHOSEN:"
         else:
             self.chosen_path = None
+            self.accepted_fit = None
+            self.tic_states.clear()
             message = ":HELA UNSELECTED:"
         self._refresh_selected_pane(highlighted=index)
         selected.focus()
         self.notify(message)
         if choosing:
             settings = self.algorithm_settings
+            metadata = self._dataset_metadata(path)
             self.push_screen(
-                ChargeScanScreen(path, settings=settings),
-                lambda confirmed: self._handle_scan_confirmation(
-                    path, settings, confirmed
-                ),
+                ChargeScanScreen(path, settings=settings, metadata=metadata),
+                lambda result: self._handle_scan_review(path, result),
             )
 
-    def _handle_scan_confirmation(
+    def _handle_scan_review(
         self,
         dataset: Path,
-        settings: AlgorithmSettings,
-        confirmed: bool,
+        result: ChargeScanResult | None,
     ) -> None:
         self.query_one("#selected-pane", SelectedOptionList).focus()
-        if confirmed:
-            self._begin_charge_scan(dataset, settings)
+        if result is None:
+            if self.chosen_path == dataset:
+                self.chosen_path = None
+            self.accepted_fit = None
+            self.tic_states.clear()
+            self._refresh_selected_pane()
+            self.notify("Fit rejected; selected datasets were preserved")
+            return
+        self.accepted_fit = result
+        self._refresh_selected_pane()
+        self.notify("Fit accepted; calculating TIC for selected datasets")
+        self._begin_tic_batch(result)
 
-    def _begin_charge_scan(
-        self,
-        dataset: Path,
-        settings: AlgorithmSettings,
+    def on_charge_scan_screen_scan_requested(
+        self, event: ChargeScanScreen.ScanRequested
     ) -> None:
+        self._begin_charge_scan(event.screen)
+
+    def _begin_charge_scan(self, screen: ChargeScanScreen) -> None:
         if self._analysis_running:
             self.notify(
                 "A charge-area scan is already running", severity="warning"
             )
             return
         self._analysis_running = True
-        self._analysis_loading_text = f"loading charge areas for {dataset.name}"
-        self._analysis_progress = "calling tickyticker.analyse() directly"
-        self._analysis_loading_step = 0
-        pane = self.query_one("#analysis-pane", Container)
-        pane.styles.display = "block"
-        self.query_one("#analysis-tabs", TabbedContent).styles.display = "none"
-        self.query_one("#analysis-loading", Static).styles.display = "block"
-        self._analysis_loading_timer.resume()
-        self._animate_analysis_loading()
-        self._execute_charge_scan(dataset, settings)
-
-    def _animate_analysis_loading(self) -> None:
-        self._analysis_loading_step = (self._analysis_loading_step + 1) % 3
-        dots = "." * (self._analysis_loading_step + 1)
-        message = f"{self._analysis_loading_text}{dots}"
-        if self._analysis_progress:
-            message += f"\n{self._analysis_progress}"
-        self.query_one("#analysis-loading", Static).update(message)
-
-    def _set_analysis_progress(self, progress: str) -> None:
-        self._analysis_progress = progress
-        self._animate_analysis_loading()
+        self._execute_charge_scan(screen)
 
     @work(
         thread=True,
@@ -1945,98 +2525,222 @@ class FileViewerApp(App[None]):
         group="charge-regions",
         exit_on_error=False,
     )
-    def _execute_charge_scan(
-        self,
-        dataset: Path,
-        settings: AlgorithmSettings,
-    ) -> None:
+    def _execute_charge_scan(self, screen: ChargeScanScreen) -> None:
         try:
             analysis = charge_regions.analyse(
-                dataset,
-                **settings.analysis_arguments(),
+                screen.dataset,
+                **screen.settings.analysis_arguments(),
                 progress=lambda message: self.call_from_thread(
-                    self._set_analysis_progress, message
+                    screen.set_progress, message
                 ),
             )
-            result = adapt_charge_scan_result(analysis, settings)
+            result = adapt_charge_scan_result(analysis, screen.settings)
         except Exception as error:
             self.call_from_thread(
                 self._finish_charge_scan,
+                screen,
                 None,
                 str(error),
                 traceback.format_exc(),
                 analysis_error_advice(error),
-                dataset,
             )
         else:
             self.call_from_thread(
                 self._finish_charge_scan,
+                screen,
                 result,
                 None,
                 None,
                 None,
-                dataset,
             )
 
     def _finish_charge_scan(
         self,
+        screen: ChargeScanScreen,
         result: ChargeScanResult | None,
         error: str | None,
         traceback_text: str | None,
         advice: str | None,
-        dataset: Path,
     ) -> None:
         self._analysis_running = False
-        self._analysis_loading_timer.pause()
-        loading = self.query_one("#analysis-loading", Static)
         if error is not None or result is None:
-            loading.styles.display = "block"
-            loading.update(Text(f"charge-area scan failed\n{error}", style="bold red"))
             self.notify("Charge-area scan failed", severity="error")
             self.push_screen(
                 AnalysisErrorScreen(
-                    dataset,
+                    screen.dataset,
                     error or "Unknown analysis failure",
                     traceback_text or "No traceback was available.",
                     advice
                     or "Click OK, choose another .d dataset, and try again.",
                 ),
+                lambda _: screen.reject_after_error(),
+            )
+            return
+        svg_url: str | None = None
+        try:
+            svg_path = write_dominant_charge_svg(result, self.plot_directory)
+        except OSError as svg_error:
+            self.notify(f"Cannot create SVG: {svg_error}", severity="warning")
+        else:
+            svg_url = (
+                f"{self.plot_base_url}/{svg_path.name}"
+                if self.plot_base_url is not None
+                else svg_path.resolve().as_uri()
+            )
+        screen.show_result(result, svg_url)
+        self.notify(f"Charge-area fit ready for review: {screen.dataset.name}")
+
+    @staticmethod
+    def _line_from_result(result: ChargeScanResult) -> tuple[float, float]:
+        line = result.line_data.get("line")
+        if not isinstance(line, dict):
+            raise RuntimeError("Fitted line parameters are unavailable")
+        try:
+            intercept = float(line["intercept"])
+            slope = float(line["slope"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise RuntimeError("Fitted line parameters are invalid") from error
+        if not np.isfinite(intercept) or not np.isfinite(slope):
+            raise RuntimeError("Fitted line parameters are not finite")
+        return intercept, slope
+
+    def _accepted_line(self) -> tuple[float, float] | None:
+        if self.accepted_fit is None:
+            return None
+        try:
+            return self._line_from_result(self.accepted_fit)
+        except RuntimeError:
+            return None
+
+    def _begin_tic_batch(self, fit: ChargeScanResult) -> None:
+        if self.chosen_path is None:
+            return
+        try:
+            intercept, slope = self._line_from_result(fit)
+        except RuntimeError as error:
+            self.push_screen(
+                AnalysisErrorScreen(
+                    self.chosen_path,
+                    str(error),
+                    traceback.format_exc(),
+                    "Reject this fit and choose another HeLa dataset.",
+                )
+            )
+            return
+        self._tic_running = True
+        paths = [self.chosen_path] + [
+            path for path in self.selected_paths if path != self.chosen_path
+        ]
+        self.tic_states = {
+            path: DatasetTicState(status="queued") for path in paths
+        }
+        self._refresh_selected_pane()
+        self._execute_tic_batch(tuple(paths), fit.settings, intercept, slope)
+
+    def _set_tic_running(self, path: Path) -> None:
+        self.tic_states[path] = DatasetTicState(status="running")
+        self._refresh_selected_pane()
+        self.query_one("#status-bar", Static).update(
+            f"Calculating below/above TIC: {path.name}"
+        )
+
+    def _set_tic_progress(self, path: Path, message: str) -> None:
+        self.query_one("#status-bar", Static).update(
+            f"TIC {path.name}: {message}"
+        )
+
+    def _set_tic_result(
+        self,
+        path: Path,
+        result: charge_regions.LineTicResult | None,
+        error: str | None,
+    ) -> None:
+        if result is None:
+            self.tic_states[path] = DatasetTicState(
+                status="error", error=error or "unknown error"
+            )
+        else:
+            self.tic_states[path] = DatasetTicState(
+                status="complete",
+                tic_below_line=result.tic_below_line,
+                tic_above_line=result.tic_above_line,
+            )
+        self._refresh_selected_pane()
+
+    @work(
+        thread=True,
+        exclusive=True,
+        group="line-tic",
+        exit_on_error=False,
+    )
+    def _execute_tic_batch(
+        self,
+        paths: tuple[Path, ...],
+        settings: AlgorithmSettings,
+        intercept: float,
+        slope: float,
+    ) -> None:
+        errors: list[tuple[Path, str, str]] = []
+        for path in paths:
+            self.call_from_thread(self._set_tic_running, path)
+            try:
+                result = charge_regions.analyse_line_tic(
+                    path,
+                    intercept=intercept,
+                    slope=slope,
+                    mz_min=settings.mz_min,
+                    mz_max=settings.mz_max,
+                    min_intensity=settings.min_intensity,
+                    threads=settings.threads,
+                    frame_stride=settings.frame_stride,
+                    progress=lambda message, current=path: self.call_from_thread(
+                        self._set_tic_progress, current, message
+                    ),
+                )
+            except Exception as error:
+                trace = traceback.format_exc()
+                errors.append((path, str(error), trace))
+                self.call_from_thread(
+                    self._set_tic_result, path, None, str(error)
+                )
+            else:
+                self.call_from_thread(
+                    self._set_tic_result, path, result, None
+                )
+        self.call_from_thread(self._finish_tic_batch, errors)
+
+    def _finish_tic_batch(
+        self, errors: list[tuple[Path, str, str]]
+    ) -> None:
+        self._tic_running = False
+        completed = sum(
+            state.status == "complete" for state in self.tic_states.values()
+        )
+        self.query_one("#status-bar", Static).update(
+            f"TIC complete: {completed} succeeded, {len(errors)} failed"
+        )
+        if errors:
+            summary = "; ".join(
+                f"{path.name}: {message}" for path, message, _ in errors
+            )
+            traces = "\n\n".join(
+                f"Dataset: {path}\n{trace}" for path, _, trace in errors
+            )
+            self.push_screen(
+                AnalysisErrorScreen(
+                    errors[0][0],
+                    f"{len(errors)} selected dataset(s) failed: {summary}",
+                    traces,
+                    "Failed rows remain marked ERROR and were excluded. "
+                    "Click OK, inspect those datasets, and retry them later.",
+                    title="SELECTED-DATASET TIC FAILED",
+                ),
                 lambda _: self.query_one(
                     "#selected-pane", SelectedOptionList
                 ).focus(),
             )
-            return
-
-        self.query_one(
-            "#analysis-dominant-plot", AnalysisPlot
-        ).show_result(result)
-        self.query_one(
-            "#analysis-histogram-plot", AnalysisPlot
-        ).show_result(result)
-        data = Text()
-        data.append("Dataset   ", style="bold #8be9fd")
-        data.append(str(dataset))
-        data.append("\nExecution ", style="bold #8be9fd")
-        data.append("in memory; no analysis files written")
-        data.append("\nFrames    ", style="bold #8be9fd")
-        data.append(str(result.visited_ms1_frames))
-        data.append("\nScans     ", style="bold #8be9fd")
-        data.append(str(int(result.sampled_scans_per_mobility_bin.sum())))
-        data.append("\nRuntime   ", style="bold #8be9fd")
-        data.append(f"{result.runtime_seconds:.2f} seconds")
-        data.append("\nThreads   ", style="bold #8be9fd")
-        data.append(str(result.effective_threads))
-        data.append("\n\nsettings.toml\n", style="bold #f2cc60")
-        data.append(settings_to_toml(result.settings))
-        data.append("\ncharge-border model\n", style="bold #f2cc60")
-        data.append(json.dumps(result.line_data, indent=2, sort_keys=True))
-        self.query_one("#analysis-data", Static).update(data)
-
-        loading.styles.display = "none"
-        tabs = self.query_one("#analysis-tabs", TabbedContent)
-        tabs.styles.display = "block"
-        tabs.active = "analysis-dominant"
-        self.notify(f"Completed in-memory charge-area scan: {dataset.name}")
+        else:
+            self.notify("Below/above TIC calculations completed")
 
     def _update_selected_status(self, index: int | None) -> None:
         status = self.query_one("#status-bar", Static)
@@ -2063,6 +2767,14 @@ class FileViewerApp(App[None]):
             self.dataset_metadata_cache[path] = metadata
         return metadata
 
+    def _current_name_column_width(self) -> int:
+        """Return one bounded filename column width for the current pane."""
+        names = [
+            f"{entry.name}/" if entry.is_dir else entry.name
+            for entry in self.entries
+        ]
+        return _column_width(names, minimum=12, maximum=44)
+
 
     def _open_directory(self, path: Path, *, highlight_name: str | None = None) -> None:
         try:
@@ -2078,10 +2790,16 @@ class FileViewerApp(App[None]):
             for entry in listing.entries
             if _matches_name_filter(entry.name, self.name_filter)
         )
+        name_width = self._current_name_column_width()
         option_list = self.query_one("#current-pane", OptionList)
         option_list.set_options(
             [
-                _entry_label(entry, marked=entry.path in self.selected_paths)
+                _entry_label(
+                    entry,
+                    marked=entry.path in self.selected_paths,
+                    metadata=self.dataset_metadata_cache.get(entry.path),
+                    name_width=name_width,
+                )
                 for entry in self.entries
             ]
         )
@@ -2150,10 +2868,20 @@ class FileViewerApp(App[None]):
             and self._is_dataset(entry)
             and _dataset_has_analysis_pair(entry.path)
         ):
+            metadata = self._dataset_metadata(entry.path)
             preview.update(
-                _dataset_metadata_text(
-                    entry.path, self._dataset_metadata(entry.path)
-                )
+                _dataset_metadata_text(entry.path, metadata)
+            )
+            self.query_one(
+                "#current-pane", CurrentOptionList
+            ).replace_option_prompt_at_index(
+                index,
+                _entry_label(
+                    entry,
+                    marked=entry.path in self.selected_paths,
+                    metadata=metadata,
+                    name_width=self._current_name_column_width(),
+                ),
             )
         elif entry.is_dir:
             try:
@@ -2234,6 +2962,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Linux advisory lock preventing concurrent UI instances",
     )
     parser.add_argument(
+        "--plot-directory",
+        type=Path,
+        default=Path("/tmp/tickyticker/plots"),
+        help="directory for uniquely named dominant-charge SVG views",
+    )
+    parser.add_argument(
+        "--plot-base-url",
+        help="browser-visible base URL serving files from --plot-directory",
+    )
+    parser.add_argument(
         "--show-hidden",
         action="store_true",
         help="show dotfiles and dot-directories initially",
@@ -2250,6 +2988,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 working_directory,
                 show_hidden=args.show_hidden,
                 settings_path=args.settings,
+                plot_directory=args.plot_directory,
+                plot_base_url=args.plot_base_url,
             )
             app.run()
     except (

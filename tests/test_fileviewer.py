@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import sqlite3
 from pathlib import Path
@@ -28,11 +27,13 @@ from tickytickertextual.app import (
     SingleInstanceLock,
     adapt_charge_scan_result,
     analysis_error_advice,
+    dominant_charge_svg,
     dominant_charge_text,
     event_histogram_text,
     format_size,
     load_algorithm_settings,
     read_dataset_description,
+    write_dominant_charge_svg,
 )
 
 
@@ -193,22 +194,31 @@ def test_dot_d_preview_shows_cached_metadata_and_file_sizes(
         connection.execute(
             "CREATE TABLE GlobalMetadata (Key TEXT PRIMARY KEY, Value TEXT)"
         )
-        connection.execute(
+        connection.executemany(
             "INSERT INTO GlobalMetadata (Key, Value) VALUES (?, ?)",
-            ("Description", "HeLa quality-control sample"),
+            (
+                ("Description", "HeLa quality-control sample"),
+                ("MzAcqRangeLower", "99.993561"),
+                ("MzAcqRangeUpper", "1700.000000"),
+            ),
+        )
+        connection.execute("CREATE TABLE Frames (Time REAL NOT NULL)")
+        connection.executemany(
+            "INSERT INTO Frames (Time) VALUES (?)",
+            ((0.0,), (1200.0,), (3661.4,)),
         )
     (dataset / "analysis.tdf_bin").write_bytes(bytes(2048))
     (dataset / "raw.bin").touch()
 
     reads = 0
-    original_reader = app_module._read_dataset_description
+    original_reader = app_module._read_dataset_metadata
 
-    def counted_reader(path: Path) -> tuple[str | None, str | None]:
+    def counted_reader(path: Path) -> app_module.DatasetMetadata:
         nonlocal reads
         reads += 1
         return original_reader(path)
 
-    monkeypatch.setattr(app_module, "_read_dataset_description", counted_reader)
+    monkeypatch.setattr(app_module, "_read_dataset_metadata", counted_reader)
 
     async def exercise() -> None:
         app = FileViewerApp(tmp_path)
@@ -221,7 +231,24 @@ def test_dot_d_preview_shows_cached_metadata_and_file_sizes(
             await pilot.press("j")
             await pilot.pause()
             rendered = str(preview.render())
+            current_row = str(
+                app.query_one("#current-pane", OptionList)
+                .get_option_at_index(1)
+                .prompt
+            )
+            ordinary_row = str(
+                app.query_one("#current-pane", OptionList)
+                .get_option_at_index(0)
+                .prompt
+            )
+            assert current_row.index("│") == ordinary_row.index("│")
+            assert "acq. m/z" not in current_row
+            assert "Gradient 1h01m01s" in current_row
             assert "HeLa quality-control sample" in rendered
+            assert "Acquisition m/z" in rendered
+            assert "99.9936 – 1700" in rendered
+            assert "Gradient length" in rendered
+            assert "1h01m01s" in rendered
             assert "analysis.tdf" in rendered
             assert format_size((dataset / "analysis.tdf").stat().st_size) in rendered
             assert "2.0 KiB" in rendered
@@ -235,6 +262,11 @@ def test_dot_d_preview_shows_cached_metadata_and_file_sizes(
             assert reads == 1
             assert "sample.d" in selected_row
             assert "HeLa quality-control sample" in selected_row
+            assert "Acq. m/z" not in selected_row
+            assert "99.9936" not in selected_row
+            assert selected_row.index("sample.d") < selected_row.index(
+                "HeLa quality-control sample"
+            ) < selected_row.index("Below") < selected_row.index("Above")
             assert str(tmp_path) not in selected_row
             assert "\n" not in selected_row
 
@@ -388,7 +420,7 @@ def test_dot_d_selection_focus_choose_and_remove(tmp_path: Path) -> None:
             assert app.selected_description_errors[dataset_b.resolve()] == (
                 "GlobalMetadata.Description is empty"
             )
-            assert "GlobalMetadata.Description is empty" in str(
+            assert "unavailable (GlobalMetadata.Description" in str(
                 selected.get_option_at_index(1).prompt
             )
 
@@ -434,14 +466,15 @@ def test_dot_d_selection_focus_choose_and_remove(tmp_path: Path) -> None:
             assert isinstance(app.screen, ChargeScanScreen)
             await pilot.press("n")
             await pilot.pause()
-
-            await pilot.press("space")
             assert app.chosen_path is None
+            assert app.selected_paths == [dataset_a.resolve(), dataset_b.resolve()]
+
             await pilot.press("space")
             assert app.chosen_path == dataset_a.resolve()
             assert isinstance(app.screen, ChargeScanScreen)
             await pilot.press("n")
             await pilot.pause()
+            assert app.chosen_path is None
 
             await pilot.press("x")
             assert app.selected_paths == [dataset_b.resolve()]
@@ -458,10 +491,13 @@ def test_dot_d_selection_focus_choose_and_remove(tmp_path: Path) -> None:
 
 def _fake_charge_result(
     settings: AlgorithmSettings | None = None,
+    *,
+    mz_min: float = 100.0,
+    mz_max: float = 1700.0,
 ) -> charge_regions.ChargeRegionResult:
     settings = settings or AlgorithmSettings()
     mz_bins = round(
-        (np.ceil(settings.mz_max) - np.floor(settings.mz_min))
+        (np.ceil(mz_max) - np.floor(mz_min))
         / settings.mz_bin_width
     )
     intensities = np.zeros(
@@ -472,7 +508,7 @@ def _fake_charge_result(
     intensities[2, 65:90, 95:140] = 60.0
     mobility_edges = np.linspace(0.6, 1.6, settings.mobility_bins + 1)
     mz_edges = np.linspace(
-        np.floor(settings.mz_min), np.ceil(settings.mz_max), mz_bins + 1
+        np.floor(mz_min), np.ceil(mz_max), mz_bins + 1
     )
     histogram = np.arange(1, 129, dtype=np.uint64)
     charges = np.array([1, 2, 3], dtype=np.int64)
@@ -503,11 +539,46 @@ def _fake_charge_result(
     )
 
 
-def test_native_plots_and_direct_analysis_panel(
+def _fake_tic_result(
+    settings: AlgorithmSettings,
+    *,
+    below: int = 100,
+    above: int = 200,
+) -> charge_regions.LineTicResult:
+    return charge_regions.LineTicResult(
+        tic_below_line=below,
+        tic_above_line=above,
+        line_intercept=1.55,
+        line_slope=-0.0005,
+        mz_min=settings.mz_min,
+        mz_max=settings.mz_max,
+        min_intensity=settings.min_intensity,
+        frame_stride=settings.frame_stride,
+        visited_ms1_frames=12,
+        runtime_seconds=0.25,
+        effective_threads=settings.threads,
+    )
+
+
+def test_modal_review_svg_and_accepted_split_tic(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     dataset = tmp_path / "sample.d"
     dataset.mkdir()
+    with sqlite3.connect(dataset / "analysis.tdf") as connection:
+        connection.execute(
+            "CREATE TABLE GlobalMetadata (Key TEXT PRIMARY KEY, Value TEXT)"
+        )
+        connection.executemany(
+            "INSERT INTO GlobalMetadata (Key, Value) VALUES (?, ?)",
+            (
+                ("Description", "HeLa test sample"),
+                ("MzAcqRangeLower", "99.993561"),
+                ("MzAcqRangeUpper", "1700.000000"),
+            ),
+        )
+    (dataset / "analysis.tdf_bin").touch()
+    initial_files = sorted(path.name for path in dataset.iterdir())
     settings = AlgorithmSettings()
     result = adapt_charge_scan_result(_fake_charge_result(settings), settings)
     dominant = dominant_charge_text(result, 80, 14).plain
@@ -517,8 +588,15 @@ def test_native_plots_and_direct_analysis_panel(
     assert "1" in dominant and "2" in dominant and "3" in dominant
     assert "raw MS1 events" in histogram
     assert "#" in histogram
+    svg = dominant_charge_svg(result)
+    assert svg.startswith("<?xml")
+    assert "Dominant charge and fitted 1+/multicharge separator" in svg
+    assert 'stroke="#ffffff"' in svg
+    standalone_svg = write_dominant_charge_svg(result, tmp_path / ".standalone")
+    assert standalone_svg.read_text() == svg
 
     calls: list[tuple[Path, dict[str, int | float]]] = []
+    tic_calls: list[tuple[Path, dict[str, object]]] = []
 
     def fake_analyse(
         dataset_path: Path,
@@ -533,10 +611,26 @@ def test_native_plots_and_direct_analysis_panel(
             progress("Processed 100 MS1 frames")
         return _fake_charge_result(settings)
 
+    def fake_line_tic(
+        dataset_path: Path,
+        **arguments: object,
+    ) -> charge_regions.LineTicResult:
+        progress = arguments.pop("progress", None)
+        tic_calls.append((Path(dataset_path), dict(arguments)))
+        if callable(progress):
+            progress("TIC analysis complete")
+        return _fake_tic_result(settings)
+
     monkeypatch.setattr(charge_regions, "analyse", fake_analyse)
+    monkeypatch.setattr(charge_regions, "analyse_line_tic", fake_line_tic)
 
     async def exercise() -> None:
-        app = FileViewerApp(tmp_path)
+        plot_directory = tmp_path / "plots"
+        app = FileViewerApp(
+            tmp_path,
+            plot_directory=plot_directory,
+            plot_base_url="http://example.test/plots",
+        )
         async with app.run_test(size=(120, 45)) as pilot:
             await pilot.press("space", "ctrl+down", "space")
             assert app.chosen_path == dataset.resolve()
@@ -549,20 +643,143 @@ def test_native_plots_and_direct_analysis_panel(
                     break
 
             assert not app._analysis_running
-            assert app.query_one("#analysis-pane").display
-            assert app.query_one("#analysis-tabs").display
-            plot = app.query_one("#analysis-dominant-plot", AnalysisPlot)
+            assert isinstance(app.screen, ChargeScanScreen)
+            review = app.screen
+            assert review.state == "review"
+            assert review.query_one("#scan-tabs").display
+            plot = review.query_one("#scan-dominant-plot", AnalysisPlot)
             assert plot.result is not None
             assert "dominant charge" in str(plot.render())
-            data = str(app.query_one("#analysis-data", Static).render())
-            assert "in memory; no analysis files written" in data
-            assert "12" in data
-            assert "min_intensity = 30.0" in data
-            assert "intercept" in data
+            compact_histogram = review.query_one(
+                "#scan-histogram-plot", AnalysisPlot
+            )
+            assert "raw MS1 events" in str(compact_histogram.render())
+            fit = str(review.query_one("#scan-fit-parameters", Static).render())
+            assert "intercept" in fit
+            assert "slope" in fit
+            assert "runtime" not in fit
+            assert review.svg_url is not None
+            assert review.svg_url.startswith(
+                "http://example.test/plots/dominant-charge-"
+            )
+            assert len(list(plot_directory.glob("dominant-charge-*.svg"))) == 1
+
+            await pilot.press("y")
+            await pilot.pause()
+            for _ in range(100):
+                await pilot.pause()
+                if not app._tic_running and not isinstance(
+                    app.screen, ChargeScanScreen
+                ):
+                    break
+
+            assert not app._tic_running
+            assert not isinstance(app.screen, ChargeScanScreen)
+            assert app.accepted_fit is not None
+            selected_row = str(
+                app.query_one("#selected-pane", OptionList)
+                .get_option_at_index(0)
+                .prompt
+            )
+            assert "Below 100 (100.0% HeLa)" in selected_row
+            assert "Above 200 (100.0% HeLa)" in selected_row
+            assert "Fit 1/K0" in selected_row
 
     asyncio.run(exercise())
     assert calls == [(dataset.resolve(), settings.analysis_arguments())]
-    assert list(dataset.iterdir()) == []
+    assert tic_calls == [
+        (
+            dataset.resolve(),
+            {
+                "intercept": 1.55,
+                "slope": -0.0005,
+                "mz_min": settings.mz_min,
+                "mz_max": settings.mz_max,
+                "min_intensity": settings.min_intensity,
+                "threads": settings.threads,
+                "frame_stride": settings.frame_stride,
+            },
+        )
+    ]
+    assert sorted(path.name for path in dataset.iterdir()) == initial_files
+
+
+def test_split_tic_continues_after_dataset_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = tuple(
+        (tmp_path / name).resolve()
+        for name in ("hela.d", "sample.d", "broken.d")
+    )
+    for path in paths:
+        path.mkdir()
+    settings = AlgorithmSettings()
+    fit = adapt_charge_scan_result(_fake_charge_result(settings), settings)
+    calls: list[Path] = []
+
+    def fake_line_tic(
+        dataset_path: Path,
+        **arguments: object,
+    ) -> charge_regions.LineTicResult:
+        path = Path(dataset_path)
+        calls.append(path)
+        if path == paths[2]:
+            raise RuntimeError("cannot read raw peaks")
+        if path == paths[1]:
+            return _fake_tic_result(settings, below=50, above=400)
+        return _fake_tic_result(settings, below=100, above=200)
+
+    monkeypatch.setattr(charge_regions, "analyse_line_tic", fake_line_tic)
+
+    async def exercise() -> None:
+        app = FileViewerApp(tmp_path)
+        async with app.run_test(size=(160, 45)) as pilot:
+            selected = app.query_one("#selected-pane", OptionList)
+            app.selected_paths = list(paths)
+            for path in paths:
+                metadata = app._dataset_metadata(path)
+                app.selected_descriptions[path] = metadata.description
+                app.selected_description_errors[path] = metadata.description_error
+            app.chosen_path = paths[0]
+            app.accepted_fit = fit
+            app._refresh_selected_pane()
+            app._begin_tic_batch(fit)
+
+            for _ in range(200):
+                await pilot.pause()
+                if not app._tic_running and isinstance(
+                    app.screen, AnalysisErrorScreen
+                ):
+                    break
+
+            assert not app._tic_running
+            assert calls == list(paths)
+            assert app.tic_states[paths[0]].status == "complete"
+            assert app.tic_states[paths[1]].status == "complete"
+            assert app.tic_states[paths[2]].status == "error"
+            hela_row = str(selected.get_option_at_index(0).prompt)
+            sample_row = str(selected.get_option_at_index(1).prompt)
+            broken_row = str(selected.get_option_at_index(2).prompt)
+            assert "Below 100 (100.0% HeLa)" in hela_row
+            assert "Above 200 (100.0% HeLa)" in hela_row
+            assert "Below 50 (50.0% HeLa)" in sample_row
+            assert "Above 400 (200.0% HeLa)" in sample_row
+            assert "Below ERROR" in broken_row
+            assert "Above ERROR" in broken_row
+            separators = [
+                [index for index, character in enumerate(row) if character == "│"]
+                for row in (hela_row, sample_row, broken_row)
+            ]
+            assert separators[0][:3] == separators[1][:3] == separators[2][:3]
+            assert isinstance(app.screen, AnalysisErrorScreen)
+            assert app.screen.error_title == "SELECTED-DATASET TIC FAILED"
+            assert "Failed rows remain marked ERROR" in app.screen.advice
+
+            await pilot.click("#analysis-error-ok")
+            await pilot.pause()
+            assert selected.has_focus
+
+    asyncio.run(exercise())
 
 
 def test_analysis_error_requires_acknowledgement_and_gives_recovery(
@@ -570,6 +787,19 @@ def test_analysis_error_requires_acknowledgement_and_gives_recovery(
 ) -> None:
     dataset = tmp_path / "weak-sample.d"
     dataset.mkdir()
+    with sqlite3.connect(dataset / "analysis.tdf") as connection:
+        connection.execute(
+            "CREATE TABLE GlobalMetadata (Key TEXT PRIMARY KEY, Value TEXT)"
+        )
+        connection.executemany(
+            "INSERT INTO GlobalMetadata (Key, Value) VALUES (?, ?)",
+            (
+                ("Description", "Weak HeLa sample"),
+                ("MzAcqRangeLower", "100"),
+                ("MzAcqRangeUpper", "1700"),
+            ),
+        )
+    (dataset / "analysis.tdf_bin").touch()
     error_message = (
         "At least three uncensored dominant 1+ cells are required for polar "
         "fitting."
@@ -602,6 +832,8 @@ def test_analysis_error_requires_acknowledgement_and_gives_recovery(
             await pilot.click("#analysis-error-ok")
             await pilot.pause()
             assert not isinstance(app.screen, AnalysisErrorScreen)
+            assert app.chosen_path is None
+            assert app.selected_paths == [dataset.resolve()]
             assert app.query_one("#selected-pane", OptionList).has_focus
 
     asyncio.run(exercise())
@@ -611,6 +843,12 @@ def test_analysis_error_advice_covers_invalid_settings() -> None:
     advice = analysis_error_advice(ValueError("m/z limits are invalid"))
     assert "press s" in advice
     assert "review the algorithm settings" in advice
+
+    metadata_advice = analysis_error_advice(
+        RuntimeError("Cannot determine acquisition m/z range")
+    )
+    assert "MzAcqRangeLower" in metadata_advice
+    assert "MzAcqRangeUpper" in metadata_advice
 
 
 def test_settings_window_saves_validated_toml(tmp_path: Path) -> None:
@@ -622,15 +860,50 @@ def test_settings_window_saves_validated_toml(tmp_path: Path) -> None:
             assert settings_path.is_file()
             await pilot.press("s")
             assert isinstance(app.screen, SettingsScreen)
+            assert len(app.screen.query("#setting-mz_min")) == 1
+            assert len(app.screen.query("#setting-mz_max")) == 1
+            app.screen.query_one("#setting-mz_min", Input).value = "150"
+            app.screen.query_one("#setting-mz_max", Input).value = "1600"
             app.screen.query_one("#setting-min_intensity", Input).value = "42.5"
             await pilot.click("#settings-save")
             await pilot.pause()
             assert not isinstance(app.screen, SettingsScreen)
+            assert app.algorithm_settings.mz_min == 150.0
+            assert app.algorithm_settings.mz_max == 1600.0
             assert app.algorithm_settings.min_intensity == 42.5
-            assert load_algorithm_settings(settings_path).min_intensity == 42.5
+            loaded = load_algorithm_settings(settings_path)
+            assert loaded.mz_min == 150.0
+            assert loaded.mz_max == 1600.0
+            assert loaded.min_intensity == 42.5
             assert "[charge_regions]" in settings_path.read_text()
+            assert "mz_min = 150.0" in settings_path.read_text()
+            assert "mz_max = 1600.0" in settings_path.read_text()
 
     asyncio.run(exercise())
+
+
+def test_loading_legacy_settings_restores_missing_comparison_bounds(
+    tmp_path: Path,
+) -> None:
+    settings_path = tmp_path / "settings.toml"
+    settings_path.write_text(
+        """[charge_regions]
+min_intensity = 42.0
+frame_stride = 5
+"""
+    )
+
+    settings = load_algorithm_settings(settings_path)
+
+    assert settings.min_intensity == 42.0
+    assert settings.frame_stride == 5
+    assert settings.mz_min == 100.0
+    assert settings.mz_max == 1700.0
+    migrated = settings_path.read_text()
+    assert "mz_min = 100.0" in migrated
+    assert "mz_max = 1700.0" in migrated
+    assert "min_intensity = 42.0" in migrated
+    assert "frame_stride = 5" in migrated
 
 
 def test_single_instance_lock_is_exclusive_and_released(tmp_path: Path) -> None:

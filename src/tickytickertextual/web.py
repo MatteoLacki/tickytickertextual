@@ -11,12 +11,47 @@ from typing import Sequence
 from textual_serve.server import Server
 
 
+class PlotServer(Server):
+    """Extend textual-serve with a non-indexed directory for generated SVGs."""
+
+    def __init__(self, *args: object, plot_directory: Path, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self.plot_directory = plot_directory
+
+    async def _make_app(self):
+        app = await super()._make_app()
+        self.plot_directory.mkdir(parents=True, exist_ok=True)
+        app.router.add_static(
+            "/plots",
+            self.plot_directory,
+            show_index=False,
+            name="plots",
+        )
+        return app
+
+
+def _effective_public_url(host: str, port: int, configured: str | None) -> str:
+    if configured:
+        return configured.rstrip("/")
+    if port == 80:
+        return f"http://{host}"
+    if port == 443:
+        return f"https://{host}"
+    return f"http://{host}:{port}"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("working_directory", nargs="?", type=Path, help="filesystem root to expose (default: current directory)")
     parser.add_argument("--host", default="127.0.0.1", help="listen address")
     parser.add_argument("--port", default=8000, type=int, help="listen port")
     parser.add_argument("--public-url", help="public URL when running behind a proxy")
+    parser.add_argument(
+        "--plot-directory",
+        type=Path,
+        default=Path("/tmp/tickyticker/plots"),
+        help="directory for uniquely named high-resolution SVG views",
+    )
     parser.add_argument(
         "--settings",
         type=Path,
@@ -52,18 +87,23 @@ def main(argv: Sequence[str] | None = None) -> None:
         str(args.settings),
         "--lock-file",
         str(args.lock_file),
+        "--plot-directory",
+        str(args.plot_directory),
+        "--plot-base-url",
+        _effective_public_url(args.host, args.port, args.public_url) + "/plots",
     ]
     if args.show_hidden:
         command_parts.append("--show-hidden")
     command = shlex.join(command_parts)
 
-    server = Server(
+    server = PlotServer(
         command,
         host=args.host,
         port=args.port,
         title=f"tickytickertextual · {root}",
         public_url=args.public_url,
         templates_path=Path(__file__).with_name("templates"),
+        plot_directory=args.plot_directory,
     )
     server.serve()
 
