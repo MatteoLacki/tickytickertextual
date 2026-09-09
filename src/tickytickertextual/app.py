@@ -82,6 +82,8 @@ class DatasetMetadata:
     gradient_length_error: str | None
     analysis_tdf_size: int | None
     analysis_tdf_bin_size: int | None
+    volume: str | None = None
+    volume_unit: str | None = None
 
 
 SETTING_DEFINITIONS = (
@@ -94,8 +96,6 @@ SETTING_DEFINITIONS = (
     ("isotope_count", "Isotope count", int),
     ("mobility_bins", "Mobility bins", int),
     ("mz_bin_width", "Final m/z bin width", float),
-    ("border_mz_left", "Border fit: left m/z", float),
-    ("border_mz_right", "Border fit: right m/z", float),
     ("threads", "Numba threads", int),
     ("scans_per_mobility_bin", "Scans per mobility bin (0 = all)", int),
 )
@@ -113,8 +113,8 @@ class InstanceAlreadyRunning(RuntimeError):
 class AlgorithmSettings:
     """The configurable charge-regions command-line parameters."""
 
-    mz_min: float = 100.0
-    mz_max: float = 1700.0
+    mz_min: float = 350.0
+    mz_max: float = 1200.0
     rt_min: float = 0.0
     rt_max: float = np.inf
     min_intensity: float = 30.0
@@ -126,6 +126,11 @@ class AlgorithmSettings:
     border_mz_right: float = 1200.0
     threads: int = 3
     scans_per_mobility_bin: int = 0
+
+    def __post_init__(self) -> None:
+        # Compatibility attributes for core callers; there is one effective range.
+        object.__setattr__(self, "border_mz_left", self.mz_min)
+        object.__setattr__(self, "border_mz_right", self.mz_max)
 
     def validate(self) -> None:
         if not np.isfinite(self.mz_min) or not np.isfinite(self.mz_max):
@@ -174,8 +179,9 @@ class AlgorithmSettings:
     def analysis_arguments(self) -> dict[str, int | float]:
         """Return keyword arguments accepted by tickyticker.analyse()."""
         return {
-            name: getattr(self, name)
-            for name, _, _ in SETTING_DEFINITIONS
+            "border_mz_left": self.mz_min,
+            "border_mz_right": self.mz_max,
+            **{name: getattr(self, name) for name, _, _ in SETTING_DEFINITIONS},
         }
 
 
@@ -269,6 +275,10 @@ def load_algorithm_settings(path: Path) -> AlgorithmSettings:
         raise ConfigurationError(f"Missing [charge_regions] table in {path}")
 
     defaults = AlgorithmSettings()
+    legacy = "border_mz_left" in section or "border_mz_right" in section
+    if legacy:
+        section["mz_min"] = section.get("border_mz_left", defaults.mz_min)
+        section["mz_max"] = section.get("border_mz_right", defaults.mz_max)
     values: dict[str, int | float] = {}
     for name, _, value_type in SETTING_DEFINITIONS:
         raw_value = section.get(name, getattr(defaults, name))
@@ -284,7 +294,7 @@ def load_algorithm_settings(path: Path) -> AlgorithmSettings:
             values[name] = float(raw_value)
     settings = AlgorithmSettings(**values)
     settings.validate()
-    if {"mz_min", "mz_max", "rt_min", "rt_max"} - section.keys():
+    if legacy or {"mz_min", "mz_max", "rt_min", "rt_max"} - section.keys():
         save_algorithm_settings(path, settings)
     return settings
 
@@ -517,7 +527,7 @@ def dominant_charge_text(
 
     output = Text(no_wrap=True)
     output.append(
-        "dominant charge: blue=1  orange=2  green=3  .:-=+*#%@=log intensity  X=border",
+        "iim ↑  dominant charge: blue=1 orange=2 green=3 .:-=+*#%@=log intensity X=border",
         style="bold",
     )
     output.append(chr(10))
@@ -653,7 +663,7 @@ def dominant_charge_svg(result: ChargeScanResult) -> str:
             ),
             '<text x="32" y="480" fill="#c9d1d9" font-size="24" '
             'text-anchor="middle" font-family="monospace" '
-            'transform="rotate(-90 32 480)">inverse ion mobility (1/K0)</text>',
+            'transform="rotate(-90 32 480)">iim</text>',
             '<rect x="1400" y="160" width="28" height="28" fill="#4c78a8"/>',
             '<text x="1440" y="183" fill="#f0f6fc" font-size="22" '
             'font-family="monospace">charge 1</text>',
@@ -837,7 +847,7 @@ def event_histogram_text(
     maximum = float(logarithms.max()) if logarithms.size else 0.0
     maximum_count = int(grouped.max()) if grouped.size else 0
     y_width = max(5, len(f"{maximum_count:,}"))
-    plot_rows = max(3, min(height - 5, 10))
+    plot_rows = max(3, height - 7)
     heights = (
         np.zeros(grouped.size, dtype=int)
         if maximum == 0
@@ -1037,6 +1047,7 @@ def _read_dataset_metadata(dataset_path: Path) -> DatasetMetadata:
     analysis_tdf_size = _file_size(database)
     analysis_tdf_bin_size = _file_size(dataset_path / "analysis.tdf_bin")
     description, description_error = _read_sample_description(dataset_path)
+    volume, volume_unit = _read_sample_volume(dataset_path)
 
     def unavailable(error: str) -> DatasetMetadata:
         return DatasetMetadata(
@@ -1046,6 +1057,7 @@ def _read_dataset_metadata(dataset_path: Path) -> DatasetMetadata:
             gradient_length_error=error,
             analysis_tdf_size=analysis_tdf_size,
             analysis_tdf_bin_size=analysis_tdf_bin_size,
+            volume=volume, volume_unit=volume_unit,
         )
 
     if not database.is_file():
@@ -1088,6 +1100,7 @@ def _read_dataset_metadata(dataset_path: Path) -> DatasetMetadata:
         gradient_length_error=gradient_error,
         analysis_tdf_size=analysis_tdf_size,
         analysis_tdf_bin_size=analysis_tdf_bin_size,
+        volume=volume, volume_unit=volume_unit,
     )
 
 
@@ -1125,6 +1138,32 @@ def _read_sample_description(
     return description, None
 
 
+def _read_sample_volume(dataset_path: Path) -> tuple[str | None, str | None]:
+    try:
+        root = ET.parse(dataset_path / "SampleInfo.xml").getroot()
+        sample = next((e for e in root.iter() if e.tag.rsplit("}", 1)[-1] == "Sample"), None)
+        value = sample.get("Volume") if sample is not None else None
+        if value is not None:
+            try:
+                valid = np.isfinite(float(value)) and float(value) >= 0
+            except ValueError:
+                valid = False
+            if not valid:
+                value = None
+        unit = next((e.get("Value") for e in root.iter() if e.get("Name") == "AutoSamplerVolumeUnit"), None)
+        return value, unit
+    except (OSError, ET.ParseError):
+        return None, None
+
+
+def volume_text(metadata: DatasetMetadata | None) -> str:
+    if metadata is None:
+        return "..."
+    if metadata.volume is None:
+        return "NA"
+    return f"{metadata.volume} {metadata.volume_unit or ''}".strip()
+
+
 def _dataset_has_analysis_pair(dataset_path: Path) -> bool:
     """Return whether a .d directory has both standard analysis files."""
     return all(
@@ -1156,13 +1195,17 @@ def _dataset_metadata_text(
             style="italic #ff7b72",
         )
     output.append("\nGradient length   ", style="dim")
-    if metadata.gradient_length_error is None:
+    if _gradient_length_text(metadata) != "NA":
         output.append(_gradient_length_text(metadata), style="#54a24b")
     else:
         output.append(
-            f"unavailable ({metadata.gradient_length_error or 'unknown error'})",
+            "NA",
             style="italic #ff7b72",
         )
+    output.append("\nVolume            ", style="dim")
+    output.append(volume_text(metadata), style="#ff7b72" if volume_text(metadata) == "NA" else "#54a24b")
+    output.append("\nFull path         ", style="dim")
+    output.append(str(dataset_path))
     output.append("\nanalysis.tdf      ", style="dim")
     output.append(format_size(metadata.analysis_tdf_size), style="#8be9fd")
     output.append("\nanalysis.tdf_bin  ", style="dim")
@@ -1172,6 +1215,8 @@ def _dataset_metadata_text(
 
 def _gradient_length_text(metadata: DatasetMetadata) -> str:
     """Format the cached Frames.Time span as hours, minutes, and seconds."""
+    if metadata.gradient_length_seconds is None or metadata.gradient_length_error is not None:
+        return "NA"
     return format_duration(metadata.gradient_length_seconds)
 
 
@@ -1214,9 +1259,9 @@ def _gradient_cell_text(
     if not entry.is_dir or not entry.name.casefold().endswith(".d"):
         return ""
     if metadata is None:
-        return "…"
+        return "..."
     if metadata.gradient_length_error is not None:
-        return "unavailable"
+        return "NA"
     return _gradient_length_text(metadata)
 
 
@@ -1234,6 +1279,7 @@ def _entry_label(
     metadata: DatasetMetadata | None = None,
     name_width: int | None = None,
     gradient_width: int | None = None,
+    volume_width: int | None = None,
 ) -> Text:
     label = Text(no_wrap=True, overflow="ellipsis")
     if entry.is_dir:
@@ -1267,9 +1313,9 @@ def _entry_label(
     if name_width is not None:
         label.append(" │ ", style="dim")
         gradient = _gradient_cell_text(entry, metadata)
-        if gradient == "unavailable":
+        if gradient == "NA":
             gradient_style = "italic #ff7b72"
-        elif gradient in {"", "…"}:
+        elif gradient in {"", "..."}:
             gradient_style = "dim"
         else:
             gradient_style = "bold #54a24b"
@@ -1281,6 +1327,10 @@ def _entry_label(
             ),
             style=gradient_style,
         )
+        if volume_width is not None:
+            label.append(" │ ", style="dim")
+            value = volume_text(metadata) if entry.name.lower().endswith(".d") else ""
+            label.append(_column_cell(value, volume_width, right=True), style="#ff7b72" if value == "NA" else "dim" if value == "..." else "#54a24b")
         label.append(" ")
     return label
 
@@ -1337,7 +1387,6 @@ class CurrentOptionList(OptionList):
         ),
         Binding("/", "app.show_filter", "Filter"),
         Binding("r", "app.reload", "Reload"),
-        Binding("s", "app.show_settings", "Settings"),
         Binding("H,shift+h", "app.show_help", "Help", key_display="Shift+H"),
     ]
 
@@ -1369,7 +1418,7 @@ class SelectedOptionList(OptionList):
             "Folders only",
             key_display="Ctrl+.",
         ),
-        Binding("s", "app.show_settings", "Settings"),
+        Binding("enter", "app.choose_reference", "Fit HeLa"),
         Binding("H,shift+h", "app.show_help", "Help", key_display="Shift+H"),
     ]
 
@@ -1655,7 +1704,7 @@ class ChargeScanScreen(ModalScreen[ChargeScanResult | None]):
     }
 
     #scan-histogram-plot {
-        height: 16;
+        height: 1fr;
         content-align: center middle;
     }
 
@@ -1674,12 +1723,14 @@ class ChargeScanScreen(ModalScreen[ChargeScanResult | None]):
         margin-left: 1;
     }
 
-    #scan-svg, #scan-redo {
+    #scan-svg, #scan-download, #scan-redo {
         display: none;
     }
     """
 
     BINDINGS = [
+        Binding("left", "previous_panel", "Previous panel", priority=True),
+        Binding("right", "next_panel", "Next panel", priority=True),
         Binding("escape,n", "decline", "No", show=False),
         Binding("y", "confirm", "Yes", show=False),
     ]
@@ -1690,11 +1741,13 @@ class ChargeScanScreen(ModalScreen[ChargeScanResult | None]):
         *,
         settings: AlgorithmSettings,
         metadata: DatasetMetadata,
+        auto_start: bool = False,
     ) -> None:
         super().__init__()
         self.dataset = dataset
         self.settings = settings
         self.metadata = metadata
+        self.auto_start = auto_start
         self.state = "confirm"
         self.result: ChargeScanResult | None = None
         self.svg_url: str | None = None
@@ -1726,20 +1779,38 @@ class ChargeScanScreen(ModalScreen[ChargeScanResult | None]):
                     yield Static(id="scan-fit-parameters", markup=False)
             with Horizontal(id="scan-buttons"):
                 yield Button("Open hi-res SVG", id="scan-svg")
-                yield Button("Redo RT", id="scan-redo")
+                yield Button("Download hi-res SVG", id="scan-download")
+                yield Button("Edit parameters", id="scan-redo")
                 yield Button("Reject", id="scan-no", variant="error")
                 yield Button("Calculate", id="scan-yes", variant="primary")
+            yield Footer(compact=True)
+
+    def action_previous_panel(self) -> None:
+        self._move_panel(-1)
+
+    def action_next_panel(self) -> None:
+        self._move_panel(1)
+
+    def _move_panel(self, direction: int) -> None:
+        if self.state != "review":
+            return
+        tabs = self.query_one("#scan-tabs", TabbedContent)
+        panels = ("scan-dominant", "scan-histogram", "scan-fit")
+        tabs.active = panels[(panels.index(tabs.active) + direction) % len(panels)]
 
     def on_mount(self) -> None:
         self.query_one("#scan-no", Button).focus()
         self._loading_timer = self.set_interval(
             0.4, self._animate_loading, pause=True
         )
+        if self.auto_start:
+            self.show_loading()
+            self.post_message(self.ScanRequested(self))
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "scan-svg":
-            if self.svg_url is not None:
-                self.app.open_url(self.svg_url, new_tab=True)
+        if event.button.id in {"scan-svg", "scan-download"}:
+            event.stop()
+            self.app.open_review_plot(self, download=event.button.id == "scan-download")
             return
         if event.button.id == "scan-redo":
             if self.state == "review":
@@ -1755,6 +1826,8 @@ class ChargeScanScreen(ModalScreen[ChargeScanResult | None]):
     ) -> None:
         if event.tabbed_content.id != "scan-tabs":
             return
+        for button_id in ("scan-svg", "scan-download"):
+            self.query_one(f"#{button_id}", Button).disabled = event.tabbed_content.active == "scan-fit"
         for plot in event.pane.query(AnalysisPlot):
             plot.call_after_refresh(plot.redraw)
 
@@ -1803,6 +1876,7 @@ class ChargeScanScreen(ModalScreen[ChargeScanResult | None]):
         self.state = "review"
         self.result = result
         self.svg_url = svg_url
+        self.query_one("#scan-question", Static).display = False
         self._loading_timer.pause()
         self.query_one("#scan-loading", Static).styles.display = "none"
         tabs = self.query_one("#scan-tabs", TabbedContent)
@@ -1818,9 +1892,8 @@ class ChargeScanScreen(ModalScreen[ChargeScanResult | None]):
         )
         svg_button = self.query_one("#scan-svg", Button)
         svg_button.styles.display = "block"
-        svg_button.disabled = svg_url is None
-        if svg_url is None:
-            svg_button.label = "SVG unavailable"
+        svg_button.disabled = False
+        self.query_one("#scan-download", Button).styles.display = "block"
         self.query_one("#scan-redo", Button).styles.display = "block"
         reject = self.query_one("#scan-no", Button)
         accept = self.query_one("#scan-yes", Button)
@@ -2029,11 +2102,12 @@ class SettingsScreen(ModalScreen[AlgorithmSettings | None]):
     BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
 
     def __init__(
-        self, settings: AlgorithmSettings, settings_path: Path | None
+        self, settings: AlgorithmSettings, settings_path: Path | None, *, run_analysis: bool = False
     ) -> None:
         super().__init__()
         self.settings = settings
         self.settings_path = settings_path
+        self.run_analysis = run_analysis
 
     def compose(self) -> ComposeResult:
         path_text = (
@@ -2042,7 +2116,7 @@ class SettingsScreen(ModalScreen[AlgorithmSettings | None]):
             else "session-only settings"
         )
         with Container(id="settings-dialog"):
-            yield Static("charge-regions settings", id="settings-title")
+            yield Static("Configure and run charge separation" if self.run_analysis else "charge-regions settings", id="settings-title")
             yield Static(
                 f"TOML: {path_text}\n"
                 "Comparison m/z bounds apply to every fit and TIC pass; "
@@ -2073,8 +2147,8 @@ class SettingsScreen(ModalScreen[AlgorithmSettings | None]):
             yield Static(id="settings-error", markup=False)
             with Horizontal(id="settings-buttons"):
                 yield Button("Defaults", id="settings-defaults")
-                yield Button("Cancel", id="settings-cancel")
-                yield Button("Save", id="settings-save", variant="primary")
+                yield Button("Reject" if self.run_analysis else "Cancel", id="settings-cancel")
+                yield Button("Calculate" if self.run_analysis else "Save", id="settings-save", variant="primary")
 
     def on_mount(self) -> None:
         self.query_one("#setting-mz_min", Input).focus()
@@ -2369,32 +2443,42 @@ class HelpScreen(ModalScreen[None]):
   /                 filter current names with a shell glob
                     (empty input clears the filter)
   r                 reload
-  s                 edit charge-regions algorithm settings
 
 [b].d datasets[/b]
-  Current row       show cached gradient length; columns remain aligned
-  Preview           for a complete .d, show Description, gradient length,
-                    and analysis file sizes instead of contents
+  Current row       show cached Gradient and Volume; one line per folder
+  Preview           Description, Gradient, Volume, full path and file sizes
   Space             add highlighted .d folder to :selected:, read its
                     cached Description, then move down
   Ctrl+Down         move focus to :selected:
   Ctrl+Up           return focus to the filesystem pane
   Click             focus a row in :selected:
-  Selected row      aligned path | Description | Below | Above | optional Fit
+  Selected row      folder | Description | Gradient | Volume | QQ | QQ/HeLa
+                    | Q | Q/HeLa | Fit (scroll horizontally on narrow screens)
   j/k or arrows     move through selected paths
   g/G               jump to first/last selected path
-  Space             choose a path as HeLa and open the fit-review popup
+  Blue rows         HeLa normalization group (auto-detected from Description)
+  Space             toggle HeLa membership without starting analysis
+  Enter             choose blue HeLa as orange fitting reference; edit settings
   Calculate         fit in the popup, then review dominant-charge map,
-                    compact histogram, curve parameters, and hi-res SVG
+                    scalable histogram, curve parameters, and hi-res SVG
+  Left/Right        switch review panels (documented in the popup footer)
+  Open/Download SVG use the active plot; no server plot files are created
   Accept fit        run thresholded below/above TIC for every selected path
-                    and report each value plus its percentage of HeLa
-  Reject            return with all selected paths preserved and no chosen HeLa
-  x or click ×      remove the current path
+                    then normalize by the mean of enabled successful HeLas
+  Rerun             edit parameters and repeat fitting and every TIC calculation
+  TIC new folders   apply accepted line/settings only to newly added datasets
+  See Chromatograms open all completed datasets in one stacked plot
+  Reject/Cancel     preserve the previous completed analysis and selected paths
+  x or click ×      remove the current path (disabled/grey during TIC processing)
+  Browser buttons   Copy table, Save table and Raw TIC CSV below the selection;
+                    enabled/red once results are ready. Full precision exports.
   h                 return focus to the middle pane
 
 [b]Analysis settings[/b]
-  m/z min/max       primary comparison window used for every dataset
-  s                 edit and save algorithm settings
+  m/z min/max       one range for fitting and TIC (defaults 350–1200)
+  RT min/max        same retention interval for every fit and TIC
+  Frame stride      every k-th MS1 frame for both fitting and TIC (no rescaling)
+  --production      suppress notification popups; errors remain in their panels
 
 Shift+H opens this help. Escape or Close dismisses it. q quits."""
 
@@ -2413,7 +2497,7 @@ Shift+H opens this help. Escape or Close dismisses it. q quits."""
 
 
 
-class FileViewerApp(App[None]):
+class FileViewerShell(App[None]):
     """Three-pane read-only filesystem navigator."""
 
     TITLE = "tickytickertextual"
@@ -2553,7 +2637,6 @@ class FileViewerApp(App[None]):
         ),
         Binding("/", "show_filter", "Filter", show=False),
         Binding("r", "reload", "Reload", show=False),
-        Binding("s", "show_settings", "Settings", show=False),
         Binding("q", "quit", "Quit"),
     ]
 
@@ -3768,8 +3851,24 @@ class FileViewerApp(App[None]):
         return self.entries[highlighted]
 
 
+# Keep one canonical module when launched with python -m, as the controller
+# imports the shell's shared widgets and dataclasses.
+if __name__ == "__main__":
+    import sys
+    sys.modules["tickytickertextual.app"] = sys.modules[__name__]
+
+from .workflow import WorkflowMixin
+
+
+class FileViewerApp(WorkflowMixin, FileViewerShell):
+    """Navigation shell with multi-HeLa analysis and browser delivery."""
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--production", action="store_true", help="Suppress toast notifications")
+    parser.add_argument("--bridge-url", help=argparse.SUPPRESS)
+    parser.add_argument("--bridge-token", help=argparse.SUPPRESS)
     parser.add_argument("working_directory", nargs="?", type=Path, help="filesystem root to expose (default: current directory)")
     parser.add_argument(
         "--settings",
@@ -3787,17 +3886,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--plot-directory",
         type=Path,
         default=Path("/tmp/tickyticker/plots"),
-        help="directory for uniquely named dominant-charge SVG views",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--plot-base-url",
-        help="browser-visible base URL serving files from --plot-directory",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--export-directory",
         type=Path,
         default=Path("/tmp/tickyticker/exports"),
-        help="directory for browser clipboard and CSV exports",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--show-hidden",
@@ -3819,6 +3918,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 plot_directory=args.plot_directory,
                 plot_base_url=args.plot_base_url,
                 export_directory=args.export_directory,
+                production=args.production,
+                bridge_url=args.bridge_url,
+                bridge_token=args.bridge_token,
             )
             app.run()
     except (

@@ -40,14 +40,19 @@ from tickytickertextual.app import (
 )
 
 
-def _write_sample_info(dataset: Path, description: str) -> None:
+def _write_sample_info(dataset: Path, description: str, *, gradient: bool = True) -> None:
     root = ET.Element("SampleTable")
-    ET.SubElement(root, "Sample", Description=description)
+    ET.SubElement(root, "Sample", Description=description, Volume="0.5")
+    ET.SubElement(root, "Property", Name="AutoSamplerVolumeUnit", Value="µl")
     ET.ElementTree(root).write(
         dataset / "SampleInfo.xml",
         encoding="utf-16",
         xml_declaration=True,
     )
+    if gradient:
+        with sqlite3.connect(dataset / "analysis.tdf") as connection:
+            connection.execute("CREATE TABLE IF NOT EXISTS Frames (Time REAL NOT NULL)")
+            connection.executemany("INSERT INTO Frames VALUES (?)", [(0,), (300,)])
 
 
 def test_scan_is_on_demand_sorted_and_hides_dotfiles(tmp_path: Path) -> None:
@@ -210,7 +215,7 @@ def test_dot_d_preview_shows_cached_metadata_and_file_sizes(
     dataset = tmp_path / "sample.d"
     dataset.mkdir()
     (dataset / "inside").mkdir()
-    _write_sample_info(dataset, "HeLa quality-control sample")
+    _write_sample_info(dataset, "HeLa quality-control sample", gradient=False)
     with sqlite3.connect(dataset / "analysis.tdf") as connection:
         connection.execute(
             "CREATE TABLE GlobalMetadata (Key TEXT PRIMARY KEY, Value TEXT)"
@@ -271,7 +276,8 @@ def test_dot_d_preview_shows_cached_metadata_and_file_sizes(
             assert "acq. m/z" not in current_row
             assert "Gradient" not in current_row
             assert "1h01m01s" in current_row
-            assert current_row.endswith("s ")
+            assert "s │" in current_row
+            assert current_row.endswith("0.5 µl ")
             assert (
                 current_header.index("Gradient") + len("Gradient")
                 == current_row.index("1h01m01s") + len("1h01m01s")
@@ -295,7 +301,7 @@ def test_dot_d_preview_shows_cached_metadata_and_file_sizes(
             )
             assert reads == 1
             assert "sample.d" in selected_row
-            assert "HeLa quality-control sample" in selected_row
+            assert app._selected_export_rows()[0][1] == "HeLa quality-control sample"
             assert "Acq. m/z" not in selected_row
             assert "99.9936" not in selected_row
             assert all(
@@ -303,8 +309,8 @@ def test_dot_d_preview_shows_cached_metadata_and_file_sizes(
                 for heading in (
                     "Path",
                     "Description",
-                    "Below",
-                    "Above",
+                    "QQ / QQ-HeLa",
+                    "Q / Q-HeLa",
                     "Fit Parameters",
                 )
             )
@@ -335,8 +341,9 @@ def test_selected_nested_dataset_path_is_relative_to_root(tmp_path: Path) -> Non
             await pilot.press("enter", "enter", "enter", "space")
             selected = app.query_one("#selected-pane", OptionList)
             row = str(selected.get_option_at_index(0).prompt)
-            assert "e/f/g/folder.d" in row
-            assert "Nested sample" in row
+            assert "folder.d" in row
+            assert "e/f/g/" not in row
+            assert app._selected_export_rows()[0][1] == "Nested sample"
             assert str(tmp_path) not in row
             assert not row.lstrip(" ×★").startswith("/")
 
@@ -448,9 +455,7 @@ def test_dot_d_selection_focus_choose_and_remove(tmp_path: Path) -> None:
             assert app.selected_descriptions[dataset_a.resolve()] == (
                 "Alpha sample description"
             )
-            assert "Alpha sample description" in str(
-                selected.get_option_at_index(0).prompt
-            )
+            assert app._selected_export_rows()[0][1] == "Alpha sample description"
 
             await pilot.press("space")
             assert app.selected_paths == [dataset_a.resolve(), dataset_b.resolve()]
@@ -460,9 +465,7 @@ def test_dot_d_selection_focus_choose_and_remove(tmp_path: Path) -> None:
             assert app.selected_description_errors[dataset_b.resolve()] == (
                 "SampleInfo.xml Sample.Description is empty"
             )
-            assert "unavailable (SampleInfo.xml" in str(
-                selected.get_option_at_index(1).prompt
-            )
+            assert app._selected_export_rows()[1][1] == "unavailable"
 
             await pilot.press("ctrl+down")
             await pilot.pause()
@@ -502,18 +505,17 @@ def test_dot_d_selection_focus_choose_and_remove(tmp_path: Path) -> None:
             assert app.focused is current
             await pilot.press("ctrl+down", "k", "space")
             assert selected.highlighted == 0
-            assert app.chosen_path == dataset_a.resolve()
-            assert isinstance(app.screen, ChargeScanScreen)
-            await pilot.press("n")
+            assert dataset_a.resolve() in app.hela_paths
+            assert not isinstance(app.screen, ChargeScanScreen)
+            await pilot.press("enter")
+            assert isinstance(app.screen, SettingsScreen)
+            await pilot.press("escape")
             await pilot.pause()
             assert app.chosen_path is None
             assert app.selected_paths == [dataset_a.resolve(), dataset_b.resolve()]
 
             await pilot.press("space")
-            assert app.chosen_path == dataset_a.resolve()
-            assert isinstance(app.screen, ChargeScanScreen)
-            await pilot.press("n")
-            await pilot.pause()
+            assert dataset_a.resolve() not in app.hela_paths
             assert app.chosen_path is None
 
             await pilot.press("x")
@@ -703,12 +705,13 @@ def test_modal_review_svg_and_accepted_split_tic(
             plot_directory=plot_directory,
             plot_base_url="http://example.test/plots",
         )
-        async with app.run_test(size=(120, 45)) as pilot:
-            await pilot.press("space", "ctrl+down", "space")
-            assert app.chosen_path == dataset.resolve()
+        async with app.run_test(size=(180, 45)) as pilot:
+            await pilot.press("space", "ctrl+down", "enter")
+            assert isinstance(app.screen, SettingsScreen)
+            await pilot.click("#settings-save")
+            assert app._pending_reference == dataset.resolve()
             assert isinstance(app.screen, ChargeScanScreen)
 
-            await pilot.press("y")
             for _ in range(50):
                 await pilot.pause()
                 if not app._analysis_running:
@@ -742,10 +745,7 @@ def test_modal_review_svg_and_accepted_split_tic(
             assert "slope" in fit
             assert "runtime" not in fit
             assert review.svg_url is not None
-            assert review.svg_url.startswith(
-                "http://example.test/plots/dominant-charge-"
-            )
-            assert len(list(plot_directory.glob("dominant-charge-*.svg"))) == 1
+            assert not plot_directory.exists()
 
             await pilot.press("y")
             await pilot.pause()
@@ -759,13 +759,15 @@ def test_modal_review_svg_and_accepted_split_tic(
             assert not app._tic_running
             assert not isinstance(app.screen, ChargeScanScreen)
             assert app.accepted_fit is not None
+            await pilot.resize_terminal(190, 45)
+            await pilot.pause()
             selected_row = str(
                 app.query_one("#selected-pane", OptionList)
                 .get_option_at_index(0)
                 .prompt
             )
-            assert "100 (100.0%)" in selected_row
-            assert "200 (100.0%)" in selected_row
+            assert "100" in selected_row and "200" in selected_row
+            assert selected_row.count("100.00%") == 2
             assert "a=1.55" in selected_row
             assert "b=-0.0005" in selected_row
             assert "Below" not in selected_row
@@ -829,6 +831,7 @@ def test_split_tic_continues_after_dataset_error(
                 app.selected_descriptions[path] = metadata.description
                 app.selected_description_errors[path] = metadata.description_error
             app.chosen_path = paths[0]
+            app.hela_paths.add(paths[0])
             app.accepted_fit = fit
             app._refresh_selected_pane()
             app._begin_tic_batch(fit)
@@ -848,10 +851,9 @@ def test_split_tic_continues_after_dataset_error(
             hela_row = str(selected.get_option_at_index(0).prompt)
             sample_row = str(selected.get_option_at_index(1).prompt)
             broken_row = str(selected.get_option_at_index(2).prompt)
-            assert "100 (100.0%)" in hela_row
-            assert "200 (100.0%)" in hela_row
-            assert "50 (50.0%)" in sample_row
-            assert "400 (200.0%)" in sample_row
+            assert hela_row.count("100.00%") == 2
+            assert "50.00%" in sample_row
+            assert "200.00%" in sample_row
             assert broken_row.count("ERROR") == 2
             assert "a=1.55" in hela_row
             assert "a=1.55" not in sample_row
@@ -903,7 +905,8 @@ def test_analysis_error_requires_acknowledgement_and_gives_recovery(
     async def exercise() -> None:
         app = FileViewerApp(tmp_path)
         async with app.run_test(size=(120, 45)) as pilot:
-            await pilot.press("space", "ctrl+down", "space", "y")
+            await pilot.press("space", "ctrl+down", "enter")
+            await pilot.click("#settings-save")
             for _ in range(50):
                 await pilot.pause()
                 if isinstance(app.screen, AnalysisErrorScreen):
@@ -944,6 +947,9 @@ def test_settings_window_saves_validated_toml(tmp_path: Path) -> None:
         async with app.run_test(size=(120, 45)) as pilot:
             assert settings_path.is_file()
             await pilot.press("s")
+            assert not isinstance(app.screen, SettingsScreen)
+            app.action_show_settings()
+            await pilot.pause()
             assert isinstance(app.screen, SettingsScreen)
             assert len(app.screen.query("#setting-mz_min")) == 1
             assert len(app.screen.query("#setting-mz_max")) == 1
@@ -982,45 +988,40 @@ frame_stride = 5
 
     assert settings.min_intensity == 42.0
     assert settings.frame_stride == 5
-    assert settings.mz_min == 100.0
-    assert settings.mz_max == 1700.0
+    assert settings.mz_min == 350.0
+    assert settings.mz_max == 1200.0
     migrated = settings_path.read_text()
-    assert "mz_min = 100.0" in migrated
-    assert "mz_max = 1700.0" in migrated
+    assert "mz_min = 350.0" in migrated
+    assert "mz_max = 1200.0" in migrated
     assert "min_intensity = 42.0" in migrated
     assert "frame_stride = 5" in migrated
 
 
-def test_browser_exports_are_written_as_utf8(
+def test_browser_exports_are_published_in_memory_as_utf8(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     dataset = tmp_path / "sample.d"
     dataset.mkdir()
     _write_sample_info(dataset, "HéLa μ-sample")
     export_directory = tmp_path / "exports"
-    real_fdopen = os.fdopen
-    export_encodings: list[str | None] = []
-
-    def checked_fdopen(
-        descriptor: int, mode: str, **kwargs: object
-    ) -> object:
-        export_encodings.append(kwargs.get("encoding"))
-        return real_fdopen(descriptor, mode, **kwargs)
-
-    monkeypatch.setattr(app_module.os, "fdopen", checked_fdopen)
+    publications = []
+    monkeypatch.setattr(FileViewerApp, "_post_browser", lambda self, payload: publications.append(payload))
 
     async def exercise() -> None:
-        app = FileViewerApp(tmp_path, export_directory=export_directory)
+        app = FileViewerApp(tmp_path, export_directory=export_directory, bridge_url="http://test")
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.press("space")
+            app.tic_states[dataset] = app_module.DatasetTicState(
+                status="complete", tic_below_line=1234567890123456789,
+                tic_above_line=200, result=_fake_tic_result(AlgorithmSettings()))
+            app._refresh_selected_pane()
             await pilot.pause()
 
     asyncio.run(exercise())
-    selected = (export_directory / "selected.tsv").read_bytes().decode("utf-8")
+    selected = next(p["exports"]["selected.tsv"] for p in publications if p.get("ready"))
     assert "HéLa μ-sample" in selected
-    assert "—" in selected
-    assert export_encodings
-    assert set(export_encodings) == {"utf-8"}
+    assert "1234567890123456789" in selected
+    assert not export_directory.exists()
 
 
 def test_single_instance_lock_is_exclusive_and_released(tmp_path: Path) -> None:

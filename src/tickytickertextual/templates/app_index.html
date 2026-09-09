@@ -17,6 +17,15 @@
             const socket = new target(...args);
             if (String(args[0]).includes("/ws")) {
               appSocket = socket;
+              // Textual may send focus/resize before its WebSocket opens.
+              const send = socket.send.bind(socket);
+              socket.send = (data) => {
+                if (socket.readyState === NativeWebSocket.CONNECTING) {
+                  socket.addEventListener('open', () => send(data), {once:true});
+                } else if (socket.readyState === NativeWebSocket.OPEN) {
+                  send(data);
+                }
+              };
             }
             return socket;
           },
@@ -55,6 +64,7 @@
           textarea.focus({ preventScroll: true });
           return true;
         };
+        window.focusTerminal = focusTerminal;
 
         window.addEventListener("DOMContentLoaded", () => {
           if (focusTerminal()) {
@@ -168,7 +178,7 @@
       #export-toolbar {
         position: fixed;
         right: 8px;
-        top: 8px;
+        bottom: 0;
         z-index: 40;
         display: none;
         gap: 6px;
@@ -190,7 +200,7 @@
         padding: 4px 8px;
         color: #c9d1d9;
         background: #161b22;
-        border: 1px solid #58a6ff;
+        border: 1px solid #ff7b72;
         font: inherit;
       }
 
@@ -198,6 +208,11 @@
         cursor: pointer;
         background: #1f6feb;
       }
+
+      #terminal { height: calc(100vh - 42px); }
+      #export-toolbar button:enabled { color: #ff7b72; }
+      #export-toolbar button:disabled { color: #777; border-color: #555; cursor: default; }
+      body.-closed #export-toolbar { display: none; }
 
       #export-status {
         min-width: 5em;
@@ -227,6 +242,18 @@
         status.textContent = message;
         status.style.color = error ? "#ff7b72" : "#8be9fd";
       }
+
+      async function updateExportButtons() {
+        let ready = false;
+        try {
+          const response = await fetch('/exports/status', {cache:'no-store'});
+          ready = response.ok && (await response.json()).ready;
+        } catch (_) {}
+        document.querySelectorAll('#export-toolbar button').forEach(button => button.disabled = !ready);
+      }
+      window.addEventListener('DOMContentLoaded', () => {
+        updateExportButtons(); setInterval(updateExportButtons, 1000);
+      });
 
       async function copySelectedTable() {
         try {
@@ -272,9 +299,9 @@
   </head>
   <body data-pingurl="{{ ping_url }}">
     <div id="export-toolbar">
-      <button type="button" onclick="copySelectedTable()">Copy table</button>
-      <button type="button" onclick="downloadExport('selected.csv')">Save table</button>
-      <button type="button" onclick="downloadExport('raw-tics.csv')">Raw TIC CSV</button>
+      <button type="button" disabled onclick="copySelectedTable()">Copy table</button>
+      <button type="button" disabled onclick="downloadExport('selected.csv')">Save table</button>
+      <button type="button" disabled onclick="downloadExport('raw-tics.csv')">Raw TIC CSV</button>
       <span id="export-status"></span>
     </div>
     <div class="dialog-container intro-dialog">

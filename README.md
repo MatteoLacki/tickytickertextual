@@ -22,22 +22,33 @@ ASCII views, with an optional high-resolution SVG for the dominant-charge map.
 
 ## Charge-area analysis
 
-In `:selected:`, Space marks or unmarks a dataset as HeLa. Marking it opens a
-large confirmation popup. **Calculate** calls tickyticker’s `analyse()`
-function directly in a background worker; the popup stays open and shows
-blinking progress. It then becomes a review window with a large colour-coded
-ASCII dominant-charge map and fitted separator, a compact vertical raw-event
-histogram, and the fitted intercept and slope. Intensity maps and general data
-dumps are not shown. **Open hi-res SVG** opens a scalable version of the
-dominant-charge separation plot in a separate browser tab.
+Folders whose Description contains `hela` (case-insensitive) automatically join
+the blue HeLa normalization group when added to `:selected:`. Space toggles
+membership without launching analysis; manual choices survive table refreshes.
+Enter on a blue HeLa opens parameter selection and marks that prospective fitting
+reference orange. **Calculate** in that parameter panel starts the fit immediately
+in a background thread, without another confirmation; **Reject** cancels.
+In the subsequent results review, **Accept fit**
+starts TIC calculations for every selected dataset. Only one HeLa supplies the
+separator. All enabled, successfully processed HeLas supply normalization means.
 
-**Reject** closes the popup, clears the HeLa choice, and preserves every path
-in `:selected:`. **Accept fit** closes it and sequentially revisits every
-selected dataset with the accepted separator. Each row reports integer TIC
-below the line, integer TIC on/above the line, and both values relative to the
-HeLa reference. Both sides use the configured raw-event intensity threshold,
-comparison m/z window, and MS1 frame stride. A failed dataset is marked
-`ERROR`, excluded from comparisons, and does not stop the remaining datasets.
+Absolute QQ (below-line multicharge) and Q (on/above-line single-charge) values
+appear as each dataset completes. Relative values appear after the batch finishes:
+`QQ / mean(HeLa QQ)` and `Q / mean(HeLa Q)`. The UI shows percentages; CSV/TSV
+store numeric ratios, with `1.0` meaning 100%. Failed HeLas are excluded visibly;
+missing references or zero means leave the corresponding ratios unavailable.
+No volume or frame-stride rescaling is applied.
+
+**Rerun** allows repeated analysis with all parameters editable, including an
+unchanged parameter set. Cancelling/rejecting a proposed rerun preserves prior
+completed results. After adding more folders, **TIC new folders** uses the accepted
+line and parameter snapshot only for those additions. New HeLas update every
+relative value at completion. Removing datasets is disabled/grey during TIC work.
+
+Left/right arrows switch review panels; the footer documents the bindings.
+Both dominant-charge and event-histogram views resize vertically. Open/download
+SVG acts on the active plot. **See Chromatograms** opens a single scalable,
+vertically stacked figure labelled with each folder name and Description.
 
 If analysis fails, the app opens a red error dialog with a colourized,
 scrollable traceback and a concrete recovery suggestion. It must be
@@ -46,19 +57,36 @@ choosing another `.d` dataset or increasing frame/scan coverage in settings.
 
 The UI imports `tickyticker.charge_regions.analyse()` and
 `analyse_line_tic()` as package APIs. Their in-memory results avoid NPZ, JSON,
-PNG, and log-file round trips. Only the explicitly requested, uniquely named
-SVG is written to the configured temporary plot directory. The regular
+PNG, and log-file round trips. SVGs stream from memory through Textual's native
+single-use delivery URLs. Viewer tabs have their own Download SVG button; no
+server plot files, expiry timers, or persistent browser storage are required.
+The regular
 tickyticker CLIs remain available for deliberate archival runs.
 
-Press `s` to edit the analysis parameters. They are validated and atomically
+Enter on a HeLa or press **Rerun** to edit parameters. They are validated and atomically
 stored in `/tmp/tickyticker/settings.toml` by default. A Linux `flock` held at
 `/tmp/tickyticker/tickytickertextual.lock` permits only one active UI session;
 the kernel releases it automatically when that process exits.
 
-The comparison minimum and maximum m/z are the first and most important
-settings: the same user-selected interval is applied to HeLa and every compared
-dataset. The border-fit left/right values describe the narrower interval used
-only to fit the separator.
+Only `mz_min` and `mz_max` are exposed, defaulting to 350–1200. This range applies
+to fitting and all TICs, including unthresholded raw TIC. Legacy TOML files use
+their former border limits as the new range and are rewritten without border
+settings. `rt_min`, `rt_max`, and `frame_stride` are shared by fit and TIC passes.
+Frame stride samples MS1 frames after retention-time filtering; TICs are not
+scaled to estimate skipped frames.
+
+Volume and its unit come from XML `Sample.Volume` and `AutoSamplerVolumeUnit`.
+They appear below Gradient length in the preview and after Gradient in `:current:`.
+Gradient length is the retention-time span from read-only `analysis.tdf` Frames.Time.
+Unread metadata shows `...`; missing or invalid Gradient or Volume shows red `NA`.
+A dataset cannot be selected unless both fields are available.
+Full paths remain available in the preview; selected rows show only folder names.
+
+The browser's **Copy table**, **Save table**, and **Raw TIC CSV** buttons sit below
+the selection. They are grey before results/during calculation and red when ready.
+Copy and Save use the same full-precision nine-column data, never terminal text.
+Table exports are held in memory, not `/tmp`. `--production` suppresses toast
+notifications; progress and error panels remain available.
 
 ## Install
 
@@ -84,12 +112,13 @@ Then open <http://127.0.0.1:8000>. To listen on the network, pass
 trusted VPN first.
 
 The Make targets default to `/mnt/bigssd/tickyticker/data`. Override the root,
-settings file, lock file, or temporary SVG directory with `DIRECTORY`,
-`SETTINGS`, `LOCK_FILE`, or `PLOT_DIRECTORY`. The directory argument of the
+settings file or lock file with `DIRECTORY`, `SETTINGS`, or `LOCK_FILE`.
+Use `PRODUCTION=1` with Make to suppress toast notifications. The directory argument of the
 underlying `tickytickertextual` and
 `tickytickertextual-web` commands remains optional and defaults to the process
-current working directory. During development, uv resolves the direct
-`tickyticker` dependency from its pinned GitHub revision.
+current working directory. In this paired checkout, uv resolves `tickyticker`
+from the editable core repository two directories above the app, ensuring the
+RT/per-frame API matches the UI. Install this checkout layout before `make sync`.
 
 The status row reports state only. All primary commands are shown in the compact, styled footer, which changes when focus moves between the filesystem and `:selected:` panes.
 
@@ -101,16 +130,17 @@ The status row reports state only. All primary commands are shown in the compact
 | `l`, right arrow, Enter | Enter an ordinary directory |
 | Space in middle pane | Add and mark a `.d`, reuse its cached Description, then move down |
 | `Ctrl+Down` / `Ctrl+Up` | Move focus between filesystem and `:selected:` |
-| Space in `:selected:` | Toggle the highlighted path as HeLa and, when choosing it, open the scan prompt |
-| `y` / Calculate | Run the in-memory charge-area analysis; in review, accept the fit |
-| `n` / Reject | Clear the HeLa choice while preserving all selected paths |
+| Space in `:selected:` | Toggle HeLa normalization membership |
+| Enter in `:selected:` | Choose an enabled HeLa for fitting and edit parameters |
+| Calculate / Reject in configuration | Start the fit immediately / cancel without changing previous results |
+| `y` / `n` in review | Accept / reject the fitted separator |
 | `x` or click `×` | Remove a path from `:selected:` |
 | `h`, left arrow, Backspace | Return to parent |
 | `g` / `G` | First / last entry |
 | `.` | Toggle hidden entries |
 | `Ctrl+.` | Toggle folder-only mode (on initially) |
 | `/` | Filter current names with a shell glob; empty input clears it |
-| `s` | Edit and save the charge-analysis settings |
+| Left/right in review | Switch between plot/parameter panels |
 | `r` | Refresh current directory |
 | Shift+H or Help | Open the overall usage popup |
 | `q` | Quit the session |
@@ -118,10 +148,7 @@ The status row reports state only. All primary commands are shown in the compact
 Navigation is confined to the root passed on the command line. Symlinks are
 displayed but never followed.
 
-Rows in `:selected:` use fixed-width columns in this order: root-relative path,
-Description, below-line TIC, on/above-line TIC, and an optional fit on the HeLa
-row.
-For example, a dataset rooted at `/a/b/c/d/e/f/g/folder.d` while serving
-`/a/b/c/d` is displayed as `e/f/g/folder.d`. Existing settings files missing
-the restored comparison bounds are migrated with defaults of 100–1700 m/z
-without changing their other configured values.
+The nine table/export columns are `Path`, `Description`, `Gradient`, `Volume`,
+`QQ`, `QQ / QQ-HeLa`, `Q`, `Q / Q-HeLa`, and `Fit Parameters`. Rows never wrap;
+wide tables scroll horizontally. A path ending in `/e/f/g/folder.d` displays
+as `folder.d`. The separate raw CSV has per-frame RT, raw TIC, QQ and Q values.

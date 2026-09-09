@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import secrets
 import shlex
 import sys
 from pathlib import Path
@@ -13,20 +14,56 @@ from textual_serve.server import Server
 
 
 class PlotServer(Server):
-    """Serve generated SVGs and a fixed allowlist of table exports."""
+    """Stream plots with Textual and keep table exports only in memory."""
 
     EXPORTS = {"selected.tsv", "selected.csv", "raw-tics.csv"}
 
     def __init__(
         self,
         *args: object,
-        plot_directory: Path,
-        export_directory: Path,
+        plot_directory: Path | None = None,
+        export_directory: Path | None = None,
+        bridge_token: str = "",
         **kwargs: object,
     ) -> None:
         super().__init__(*args, **kwargs)
         self.plot_directory = plot_directory
         self.export_directory = export_directory
+        self.bridge_token = bridge_token
+        self.exports: dict[str, str] = {}
+        self.exports_ready = False
+        self._connected_uis = 0
+
+    async def on_startup(self, app):
+        # The subprocess command contains the internal bridge credential.
+        self.console.print(f"Serving {self.title} on {self.public_url}")
+
+    async def handle_websocket(self, request):
+        # A disconnected UI must not leave a stale table available for copying.
+        self._connected_uis += 1
+        try:
+            return await super().handle_websocket(request)
+        finally:
+            self._connected_uis -= 1
+            if not self._connected_uis:
+                self.exports_ready = False
+                self.exports.clear()
+
+    async def _publish(self, request):
+        if not self.bridge_token or not secrets.compare_digest(
+            request.headers.get("Authorization", ""), "Bearer " + self.bridge_token
+        ):
+            raise aiohttp_web.HTTPForbidden()
+        payload = await request.json()
+        exports = payload.get("exports", {})
+        if not isinstance(exports, dict) or any(k not in self.EXPORTS or not isinstance(v, str) for k, v in exports.items()):
+            raise aiohttp_web.HTTPBadRequest()
+        self.exports_ready = bool(payload.get("ready"))
+        self.exports = exports if self.exports_ready else {}
+        return aiohttp_web.json_response({"ok": True})
+
+    async def _export_status(self, request):
+        return aiohttp_web.json_response({"ready": self.exports_ready}, headers={"Cache-Control": "no-store"})
 
     async def _download_export(
         self, request: aiohttp_web.Request
@@ -34,11 +71,12 @@ class PlotServer(Server):
         filename = request.match_info["filename"]
         if filename not in self.EXPORTS:
             raise aiohttp_web.HTTPNotFound()
-        path = self.export_directory / filename
-        if not path.is_file():
+        if not self.exports_ready or filename not in self.exports:
             raise aiohttp_web.HTTPNotFound(text="Export is not ready yet")
-        return aiohttp_web.FileResponse(
-            path,
+        return aiohttp_web.Response(
+            body=self.exports[filename].encode("utf-8"),
+            content_type="text/tab-separated-values" if filename.endswith("tsv") else "text/csv",
+            charset="utf-8",
             headers={
                 "Content-Disposition": f'attachment; filename="{filename}"',
                 "Cache-Control": "no-store",
@@ -47,14 +85,9 @@ class PlotServer(Server):
 
     async def _make_app(self):
         app = await super()._make_app()
-        self.plot_directory.mkdir(parents=True, exist_ok=True)
-        self.export_directory.mkdir(parents=True, exist_ok=True)
-        app.router.add_static(
-            "/plots",
-            self.plot_directory,
-            show_index=False,
-            name="plots",
-        )
+        app._client_max_size = 64 * 1024 * 1024
+        app.router.add_post("/_publish", self._publish)
+        app.router.add_get("/exports/status", self._export_status)
         app.router.add_get(
             "/exports/{filename}",
             self._download_export,
@@ -75,6 +108,7 @@ def _effective_public_url(host: str, port: int, configured: str | None) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--production", action="store_true", help="Suppress notification popups")
     parser.add_argument("working_directory", nargs="?", type=Path, help="filesystem root to expose (default: current directory)")
     parser.add_argument("--host", default="127.0.0.1", help="listen address")
     parser.add_argument("--port", default=8000, type=int, help="listen port")
@@ -83,7 +117,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--plot-directory",
         type=Path,
         default=Path("/tmp/tickyticker/plots"),
-        help="directory for uniquely named high-resolution SVG views",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--settings",
@@ -95,7 +129,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--export-directory",
         type=Path,
         default=Path("/tmp/tickyticker/exports"),
-        help="directory for selected-table and per-frame TIC exports",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--lock-file",
@@ -109,6 +143,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
+    token = secrets.token_urlsafe(32)
     working_directory = args.working_directory or Path.cwd()
     try:
         root = working_directory.expanduser().resolve(strict=True)
@@ -118,6 +153,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise SystemExit(f"Root is not a directory: {root}")
 
     command_parts = [
+        "env", "-u", "NO_COLOR",
         sys.executable,
         "-m",
         "tickytickertextual.app",
@@ -126,15 +162,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         str(args.settings),
         "--lock-file",
         str(args.lock_file),
-        "--plot-directory",
-        str(args.plot_directory),
-        "--plot-base-url",
-        _effective_public_url(args.host, args.port, args.public_url) + "/plots",
-        "--export-directory",
-        str(args.export_directory),
+        "--bridge-url",
+        _effective_public_url("127.0.0.1" if args.host in {"0.0.0.0", "localhost"} else args.host, args.port, None),
+        "--bridge-token", token,
     ]
     if args.show_hidden:
         command_parts.append("--show-hidden")
+    if args.production:
+        command_parts.append("--production")
     command = shlex.join(command_parts)
 
     server = PlotServer(
@@ -146,6 +181,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         templates_path=Path(__file__).with_name("templates"),
         plot_directory=args.plot_directory,
         export_directory=args.export_directory,
+        bridge_token=token,
     )
     server.serve()
 
