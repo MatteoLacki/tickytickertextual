@@ -11,13 +11,11 @@ file index, recursive scan, application database, upload, rename, or delete oper
 Folder-only mode is enabled initially. Ordinary folders are listed before `.d`
 datasets, while files can be revealed with `Ctrl+.`. The right pane follows the
 same mode for ordinary folders. When a `.d` contains both `analysis.tdf` and
-`analysis.tdf_bin`, its preview shows `GlobalMetadata.Description`, the
-dataset-specific acquisition range from `MzAcqRangeLower` and
-`MzAcqRangeUpper`, the gradient length calculated from the span of
-`Frames.Time`, and the human-readable sizes of those two files instead of
-exposing its contents. The metadata is cached and reused if the dataset is
-added to `:selected:`. Once loaded, gradient length also appears in the aligned
-current-pane row; acquisition m/z remains in the right preview. The app does not
+`analysis.tdf_bin`, its preview shows the `SampleInfo.xml` Description, the
+gradient length calculated from the span of `Frames.Time`, and the
+human-readable sizes of those two files instead of exposing its contents. The
+metadata is cached and reused if the dataset is added to `:selected:`. Once
+loaded, gradient length also appears in the aligned current-pane row. The app does not
 decode or preview filesystem images.
 Tickyticker results are rendered separately as responsive terminal-native
 ASCII views, with an optional high-resolution SVG for the dominant-charge map.
@@ -59,9 +57,8 @@ the kernel releases it automatically when that process exits.
 
 The comparison minimum and maximum m/z are the first and most important
 settings: the same user-selected interval is applied to HeLa and every compared
-dataset. Each dataset's acquisition m/z range remains visible as context in the
-right filesystem preview and fit-confirmation popup. The border-fit left/right values describe
-the narrower interval used only to fit the separator.
+dataset. The border-fit left/right values describe the narrower interval used
+only to fit the separator.
 
 ## Install
 
@@ -123,7 +120,7 @@ displayed but never followed.
 
 Rows in `:selected:` use fixed-width columns in this order: root-relative path,
 Description, below-line TIC, on/above-line TIC, and an optional fit on the HeLa
-row. Acquisition m/z is intentionally omitted from these rows.
+row.
 For example, a dataset rooted at `/a/b/c/d/e/f/g/folder.d` while serving
 `/a/b/c/d` is displayed as `e/f/g/folder.d`. Existing settings files missing
 the restored comparison bounds are migrated with defaults of 100–1700 m/z

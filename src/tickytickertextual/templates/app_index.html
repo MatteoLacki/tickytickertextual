@@ -164,6 +164,45 @@
       #start.-delay {
         display: flex;
       }
+
+      #export-toolbar {
+        position: fixed;
+        right: 8px;
+        top: 8px;
+        z-index: 40;
+        display: none;
+        gap: 6px;
+        align-items: center;
+        padding: 4px 6px;
+        color: #c9d1d9;
+        background: rgba(13, 17, 23, 0.92);
+        border: 1px solid #30363d;
+        font: 12px "Roboto Mono", menlo, monospace;
+      }
+
+      body.-first-byte #export-toolbar {
+        display: flex;
+      }
+
+      #export-toolbar button {
+        display: inline-block;
+        margin: 0;
+        padding: 4px 8px;
+        color: #c9d1d9;
+        background: #161b22;
+        border: 1px solid #58a6ff;
+        font: inherit;
+      }
+
+      #export-toolbar button:hover {
+        cursor: pointer;
+        background: #1f6feb;
+      }
+
+      #export-status {
+        min-width: 5em;
+        color: #8be9fd;
+      }
     </style>
     <script>
       function getStartUrl() {
@@ -182,9 +221,62 @@
         }
         window.location.href = getStartUrl();
       }
+
+      function exportStatus(message, error = false) {
+        const status = document.getElementById("export-status");
+        status.textContent = message;
+        status.style.color = error ? "#ff7b72" : "#8be9fd";
+      }
+
+      async function copySelectedTable() {
+        try {
+          const response = await fetch(`/exports/selected.tsv?t=${Date.now()}`, {
+            cache: "no-store",
+          });
+          if (!response.ok) throw new Error("table is not ready");
+          const text = await response.text();
+          let copied = false;
+          if (navigator.clipboard && window.isSecureContext) {
+            await navigator.clipboard.writeText(text);
+            copied = true;
+          } else {
+            const textarea = document.createElement("textarea");
+            textarea.value = text;
+            textarea.style.position = "fixed";
+            textarea.style.opacity = "0";
+            document.body.appendChild(textarea);
+            textarea.focus();
+            textarea.select();
+            copied = document.execCommand("copy");
+            textarea.remove();
+          }
+          if (!copied) throw new Error("browser blocked clipboard access");
+          exportStatus("copied");
+          focusTerminal();
+        } catch (error) {
+          exportStatus(error.message, true);
+        }
+      }
+
+      function downloadExport(filename) {
+        const link = document.createElement("a");
+        link.href = `/exports/${filename}?t=${Date.now()}`;
+        link.download = filename;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        exportStatus("download");
+        focusTerminal();
+      }
     </script>
   </head>
   <body data-pingurl="{{ ping_url }}">
+    <div id="export-toolbar">
+      <button type="button" onclick="copySelectedTable()">Copy table</button>
+      <button type="button" onclick="downloadExport('selected.csv')">Save table</button>
+      <button type="button" onclick="downloadExport('raw-tics.csv')">Raw TIC CSV</button>
+      <span id="export-status"></span>
+    </div>
     <div class="dialog-container intro-dialog">
       <div class="shade"></div>
       <div class="intro">

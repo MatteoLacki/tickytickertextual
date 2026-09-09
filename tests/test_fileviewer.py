@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sqlite3
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import numpy as np
@@ -37,6 +38,16 @@ from tickytickertextual.app import (
     read_dataset_description,
     write_dominant_charge_svg,
 )
+
+
+def _write_sample_info(dataset: Path, description: str) -> None:
+    root = ET.Element("SampleTable")
+    ET.SubElement(root, "Sample", Description=description)
+    ET.ElementTree(root).write(
+        dataset / "SampleInfo.xml",
+        encoding="utf-16",
+        xml_declaration=True,
+    )
 
 
 def test_scan_is_on_demand_sorted_and_hides_dotfiles(tmp_path: Path) -> None:
@@ -103,19 +114,12 @@ def test_preview_scan_can_be_bounded(tmp_path: Path) -> None:
     assert listing.truncated
 
 
-def test_reads_dataset_description_from_global_metadata(tmp_path: Path) -> None:
+def test_reads_dataset_description_from_sample_info_xml(tmp_path: Path) -> None:
     dataset = tmp_path / "sample.d"
     dataset.mkdir()
     assert read_dataset_description(dataset) is None
 
-    with sqlite3.connect(dataset / "analysis.tdf") as connection:
-        connection.execute(
-            "CREATE TABLE GlobalMetadata (Key TEXT PRIMARY KEY, Value TEXT)"
-        )
-        connection.execute(
-            "INSERT INTO GlobalMetadata (Key, Value) VALUES (?, ?)",
-            ("Description", "2022-148-01 4P Mix"),
-        )
+    _write_sample_info(dataset, "2022-148-01 4P Mix")
 
     assert read_dataset_description(dataset) == "2022-148-01 4P Mix"
 
@@ -206,6 +210,7 @@ def test_dot_d_preview_shows_cached_metadata_and_file_sizes(
     dataset = tmp_path / "sample.d"
     dataset.mkdir()
     (dataset / "inside").mkdir()
+    _write_sample_info(dataset, "HeLa quality-control sample")
     with sqlite3.connect(dataset / "analysis.tdf") as connection:
         connection.execute(
             "CREATE TABLE GlobalMetadata (Key TEXT PRIMARY KEY, Value TEXT)"
@@ -213,7 +218,6 @@ def test_dot_d_preview_shows_cached_metadata_and_file_sizes(
         connection.executemany(
             "INSERT INTO GlobalMetadata (Key, Value) VALUES (?, ?)",
             (
-                ("Description", "HeLa quality-control sample"),
                 ("MzAcqRangeLower", "99.993561"),
                 ("MzAcqRangeUpper", "1700.000000"),
             ),
@@ -273,8 +277,7 @@ def test_dot_d_preview_shows_cached_metadata_and_file_sizes(
                 == current_row.index("1h01m01s") + len("1h01m01s")
             )
             assert "HeLa quality-control sample" in rendered
-            assert "Acquisition m/z" in rendered
-            assert "99.9936 – 1700" in rendered
+            assert "Acquisition m/z" not in rendered
             assert "Gradient length" in rendered
             assert "1h01m01s" in rendered
             assert "analysis.tdf" in rendered
@@ -319,13 +322,10 @@ def test_dot_d_preview_shows_cached_metadata_and_file_sizes(
 def test_selected_nested_dataset_path_is_relative_to_root(tmp_path: Path) -> None:
     dataset = tmp_path / "e" / "f" / "g" / "folder.d"
     dataset.mkdir(parents=True)
+    _write_sample_info(dataset, "Nested sample")
     with sqlite3.connect(dataset / "analysis.tdf") as connection:
         connection.execute(
             "CREATE TABLE GlobalMetadata (Key TEXT PRIMARY KEY, Value TEXT)"
-        )
-        connection.execute(
-            "INSERT INTO GlobalMetadata (Key, Value) VALUES (?, ?)",
-            ("Description", "Nested sample"),
         )
     (dataset / "analysis.tdf_bin").touch()
 
@@ -401,13 +401,10 @@ def test_dot_d_selection_focus_choose_and_remove(tmp_path: Path) -> None:
         (dataset_a, "Alpha sample description"),
         (dataset_b, ""),
     ):
+        _write_sample_info(dataset, description)
         with sqlite3.connect(dataset / "analysis.tdf") as connection:
             connection.execute(
                 "CREATE TABLE GlobalMetadata (Key TEXT PRIMARY KEY, Value TEXT)"
-            )
-            connection.execute(
-                "INSERT INTO GlobalMetadata (Key, Value) VALUES (?, ?)",
-                ("Description", description),
             )
 
     async def exercise() -> None:
@@ -461,9 +458,9 @@ def test_dot_d_selection_focus_choose_and_remove(tmp_path: Path) -> None:
             assert current.highlighted == 2
             assert str(current.get_option_at_index(2).prompt).startswith("✓ ")
             assert app.selected_description_errors[dataset_b.resolve()] == (
-                "GlobalMetadata.Description is empty"
+                "SampleInfo.xml Sample.Description is empty"
             )
-            assert "unavailable (GlobalMetadata.Description" in str(
+            assert "unavailable (SampleInfo.xml" in str(
                 selected.get_option_at_index(1).prompt
             )
 
@@ -588,16 +585,32 @@ def _fake_tic_result(
     below: int = 100,
     above: int = 200,
 ) -> charge_regions.LineTicResult:
+    frame_ids = np.array([1, 3, 5], dtype=np.uint32)
+    below_per_frame = np.array(
+        [below // 4, below // 4, below - 2 * (below // 4)],
+        dtype=np.uint64,
+    )
+    above_per_frame = np.array(
+        [above // 4, above // 4, above - 2 * (above // 4)],
+        dtype=np.uint64,
+    )
     return charge_regions.LineTicResult(
         tic_below_line=below,
         tic_above_line=above,
+        frame_ids=frame_ids,
+        retention_times_seconds=np.array([60.0, 120.0, 180.0]),
+        tic_below_line_per_frame=below_per_frame,
+        tic_above_line_per_frame=above_per_frame,
+        raw_tic_per_frame=below_per_frame + above_per_frame + 10,
         line_intercept=1.55,
         line_slope=-0.0005,
         mz_min=settings.mz_min,
         mz_max=settings.mz_max,
+        rt_min=settings.rt_min,
+        rt_max=settings.rt_max,
         min_intensity=settings.min_intensity,
         frame_stride=settings.frame_stride,
-        visited_ms1_frames=12,
+        visited_ms1_frames=len(frame_ids),
         runtime_seconds=0.25,
         effective_threads=settings.threads,
     )
@@ -608,6 +621,7 @@ def test_modal_review_svg_and_accepted_split_tic(
 ) -> None:
     dataset = tmp_path / "sample.d"
     dataset.mkdir()
+    _write_sample_info(dataset, "HeLa test sample")
     with sqlite3.connect(dataset / "analysis.tdf") as connection:
         connection.execute(
             "CREATE TABLE GlobalMetadata (Key TEXT PRIMARY KEY, Value TEXT)"
@@ -615,7 +629,6 @@ def test_modal_review_svg_and_accepted_split_tic(
         connection.executemany(
             "INSERT INTO GlobalMetadata (Key, Value) VALUES (?, ?)",
             (
-                ("Description", "HeLa test sample"),
                 ("MzAcqRangeLower", "99.993561"),
                 ("MzAcqRangeUpper", "1700.000000"),
             ),
@@ -771,6 +784,8 @@ def test_modal_review_svg_and_accepted_split_tic(
                 "min_intensity": settings.min_intensity,
                 "threads": settings.threads,
                 "frame_stride": settings.frame_stride,
+                "rt_min": settings.rt_min,
+                "rt_max": settings.rt_max,
             },
         )
     ]
@@ -862,6 +877,7 @@ def test_analysis_error_requires_acknowledgement_and_gives_recovery(
 ) -> None:
     dataset = tmp_path / "weak-sample.d"
     dataset.mkdir()
+    _write_sample_info(dataset, "Weak HeLa sample")
     with sqlite3.connect(dataset / "analysis.tdf") as connection:
         connection.execute(
             "CREATE TABLE GlobalMetadata (Key TEXT PRIMARY KEY, Value TEXT)"
@@ -869,7 +885,6 @@ def test_analysis_error_requires_acknowledgement_and_gives_recovery(
         connection.executemany(
             "INSERT INTO GlobalMetadata (Key, Value) VALUES (?, ?)",
             (
-                ("Description", "Weak HeLa sample"),
                 ("MzAcqRangeLower", "100"),
                 ("MzAcqRangeUpper", "1700"),
             ),
@@ -919,11 +934,6 @@ def test_analysis_error_advice_covers_invalid_settings() -> None:
     assert "press s" in advice
     assert "review the algorithm settings" in advice
 
-    metadata_advice = analysis_error_advice(
-        RuntimeError("Cannot determine acquisition m/z range")
-    )
-    assert "MzAcqRangeLower" in metadata_advice
-    assert "MzAcqRangeUpper" in metadata_advice
 
 
 def test_settings_window_saves_validated_toml(tmp_path: Path) -> None:
@@ -979,6 +989,38 @@ frame_stride = 5
     assert "mz_max = 1700.0" in migrated
     assert "min_intensity = 42.0" in migrated
     assert "frame_stride = 5" in migrated
+
+
+def test_browser_exports_are_written_as_utf8(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dataset = tmp_path / "sample.d"
+    dataset.mkdir()
+    _write_sample_info(dataset, "HéLa μ-sample")
+    export_directory = tmp_path / "exports"
+    real_fdopen = os.fdopen
+    export_encodings: list[str | None] = []
+
+    def checked_fdopen(
+        descriptor: int, mode: str, **kwargs: object
+    ) -> object:
+        export_encodings.append(kwargs.get("encoding"))
+        return real_fdopen(descriptor, mode, **kwargs)
+
+    monkeypatch.setattr(app_module.os, "fdopen", checked_fdopen)
+
+    async def exercise() -> None:
+        app = FileViewerApp(tmp_path, export_directory=export_directory)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.press("space")
+            await pilot.pause()
+
+    asyncio.run(exercise())
+    selected = (export_directory / "selected.tsv").read_bytes().decode("utf-8")
+    assert "HéLa μ-sample" in selected
+    assert "—" in selected
+    assert export_encodings
+    assert set(export_encodings) == {"utf-8"}
 
 
 def test_single_instance_lock_is_exclusive_and_released(tmp_path: Path) -> None:
