@@ -12,6 +12,7 @@ from textual.containers import Horizontal, Vertical
 from textual.widgets import Button, Footer, Header, Static
 
 from . import app as a
+from .browser_driver import BrowserAction
 from .plots import combined_chromatograms_svg, event_histogram_svg
 
 
@@ -54,8 +55,30 @@ class WorkflowMixin:
             yield Button("See Chromatograms", id="open-tic-plot", disabled=True)
             yield Button("TIC new folders", id="tic-new", disabled=True)
             yield Button("Rerun", id="redo-analysis", disabled=True)
+        yield Static("Select a blue HeLa in :selected: and press Enter to set analysis parameters, then Calculate.",
+                     id="analysis-hint")
         yield Static(id="status-bar")
         yield Footer(compact=True)
+
+    def on_mount(self, event):
+        event.prevent_default()
+        super().on_mount()
+        if self.bridge_url:
+            self.query_one("#analysis-actions").display = False
+
+    def on_browser_action(self, event: BrowserAction):
+        if not self._browser_actions().get(event.action):
+            return
+        if event.action == "chromatograms":
+            self._open_selected_tic_plot()
+        elif event.action == "rerun":
+            self._request_main_redo()
+        elif event.action == "tic-new":
+            self._begin_tic_batch(self.accepted_fit, only_new=True)
+
+    def on_descendant_focus(self, event):
+        # Keep the browser toolbar in sync when a modal opens or closes.
+        self._publish_exports()
 
     def action_select_dataset(self):
         if self._tic_running or self._analysis_running:
@@ -113,7 +136,7 @@ class WorkflowMixin:
         self._refresh_selected_pane()
 
     def action_choose_reference(self):
-        if self._analysis_running or self._tic_running:
+        if self._analysis_running or self._tic_running or len(self.screen_stack) != 1:
             return
         selected = self.query_one("#selected-pane", a.SelectedOptionList)
         index = selected.highlighted
@@ -149,6 +172,8 @@ class WorkflowMixin:
         )
 
     def on_option_list_option_selected(self, event):
+        event.prevent_default()
+        event.stop()
         if event.option_list.id == "selected-pane":
             self.action_choose_reference()
         else:
@@ -166,7 +191,8 @@ class WorkflowMixin:
         self.query_one("#selected-pane", a.SelectedOptionList).focus()
 
     def _request_main_redo(self):
-        if self._analysis_running or self._tic_running or self.chosen_path is None:
+        if (self._analysis_running or self._tic_running or self.chosen_path is None
+                or len(self.screen_stack) != 1 or self._pending_reference is not None):
             return
         self._pending_reference = self.chosen_path
         self.push_screen(
@@ -175,12 +201,16 @@ class WorkflowMixin:
         )
 
     def on_charge_scan_screen_redo_requested(self, event):
+        event.prevent_default()
+        event.stop()
         self.push_screen(
             a.SettingsScreen(event.screen.settings, self.settings_path, run_analysis=True),
             lambda settings: self._redo_open_screen(event.screen, settings),
         )
 
     def on_button_pressed(self, event):
+        event.prevent_default()
+        event.stop()
         if event.button.id == "tic-new":
             if self.accepted_fit is not None:
                 self._begin_tic_batch(self.accepted_fit, only_new=True)
@@ -332,10 +362,24 @@ class WorkflowMixin:
                         for p in self.selected_paths)
                 and any(s.status == "complete" for s in self.tic_states.values()))
 
+    def _browser_actions(self):
+        busy = self._tic_running or self._analysis_running
+        main_screen = len(self.screen_stack) == 1
+        return {
+            "chromatograms": not busy and any(
+                state.status == "complete" and state.result is not None
+                for path, state in self.tic_states.items() if path in self.selected_paths
+            ),
+            "rerun": main_screen and not busy and self.chosen_path is not None and self.accepted_fit is not None,
+            "tic-new": main_screen and not busy and self.accepted_fit is not None
+                       and any(path not in self.tic_states for path in self.selected_paths),
+        }
+
     def _update_analysis_actions(self):
         busy = self._tic_running or self._analysis_running
-        self.query_one("#open-tic-plot", Button).disabled = not self._results_ready()
-        self.query_one("#redo-analysis", Button).disabled = busy or self.chosen_path is None
+        actions = self._browser_actions()
+        self.query_one("#open-tic-plot", Button).disabled = not actions["chromatograms"]
+        self.query_one("#redo-analysis", Button).disabled = not actions["rerun"]
         new = self.accepted_fit is not None and any(p not in self.tic_states for p in self.selected_paths)
         button = self.query_one("#tic-new", Button)
         button.display = new
@@ -363,7 +407,7 @@ class WorkflowMixin:
                     ("Path", "Description", "Frame", "Retention Time (s)", "Retention Time", "Raw TIC", "QQ", "Q"),
                     self._raw_tic_export_rows(), delimiter=","),
             }
-        payload = {"ready": ready, "exports": exports}
+        payload = {"ready": ready, "exports": exports, "actions": self._browser_actions()}
         if payload == self._last_publication:
             return
         try:
@@ -380,11 +424,18 @@ class WorkflowMixin:
                 from .plots import svg_viewer_html
                 content, mime = svg_viewer_html(svg, filename), "text/html"
                 filename = filename.removesuffix(".svg") + ".html"
+            if self.bridge_url:
+                result = self._post_browser({"document": {
+                    "content": content, "filename": filename, "mime": mime,
+                    "disposition": "attachment" if download else "inline",
+                }})
+                self.open_url(result["url"] + ("?download=1" if download else ""), new_tab=True)
+                return
             self.deliver_text(io.StringIO(content), save_filename=filename,
                               mime_type=mime, encoding="utf-8",
                               open_method="download" if download else "browser")
         except Exception as error:
-            self.notify(f"Cannot deliver SVG: {error}", severity="error")
+            self.query_one("#status-bar", Static).update(f"Cannot deliver SVG: {error}")
 
     def open_review_plot(self, screen, download=False):
         if screen.result is None:
@@ -406,7 +457,8 @@ class WorkflowMixin:
     def _open_selected_tic_plot(self):
         datasets = [(path, self.selected_descriptions.get(path) or "", self.tic_states[path].result)
                     for path in self.selected_paths if path in self.tic_states
-                    and self.tic_states[path].status == "complete"]
+                    and self.tic_states[path].status == "complete"
+                    and self.tic_states[path].result is not None]
         if datasets:
             self._deliver_svg(combined_chromatograms_svg(datasets), "chromatograms.svg")
 

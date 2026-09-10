@@ -16,6 +16,7 @@ dependencies = [
     "textual>=6,<9",
     "textual-serve>=1.1.3,<2",
     "aiohttp>=3.9,<4",
+    "aiohttp-jinja2>=1.6,<2",
 ]
 
 [tool.uv.sources]
@@ -34,7 +35,7 @@ tickytickertextual-web = "tickytickertextual.web:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-tickytickertextual = ["templates/*.html"]
+tickytickertextual = ["templates/*.html", "defaults.toml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -14,12 +14,13 @@ from test_fileviewer import _fake_charge_result, _fake_tic_result, _write_sample
 class BrowserFixture(FileViewerApp):
     BINDINGS = [Binding("f2", "review_fixture", show=False),
                 Binding("f4", "chrom_fixture", show=False),
-                Binding("f5", "download_fixture", show=False)]
+                Binding("f5", "download_fixture", show=False),
+                Binding("f6", "dominant_fixture", show=False)]
 
-    def on_mount(self):
+    def on_mount(self, event):
         self.no_color = False
         self._filters = [f for f in self._filters if f.__class__.__name__ not in {"Monochrome", "NoColor"}]
-        super().on_mount()
+        super().on_mount(event)
         settings = self.algorithm_settings
         self.accepted_fit = adapt_charge_scan_result(_fake_charge_result(settings), settings)
         for name, description, below, above in (
@@ -43,6 +44,10 @@ class BrowserFixture(FileViewerApp):
 
     def action_chrom_fixture(self):
         self._open_selected_tic_plot()
+
+    def action_dominant_fixture(self):
+        from tickytickertextual.app import dominant_charge_svg
+        self._deliver_svg(dominant_charge_svg(self.accepted_fit), "dominant-charge.svg", True)
 
     def action_download_fixture(self):
         from tickytickertextual.plots import event_histogram_svg

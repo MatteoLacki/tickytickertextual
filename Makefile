@@ -1,9 +1,9 @@
 UV ?= uv
 DIRECTORY ?= /mnt/bigssd/tickyticker/data
-SETTINGS ?= /tmp/tickyticker/settings.toml
+SETTINGS ?= $(CURDIR)/src/tickytickertextual/defaults.toml
 LOCK_FILE ?= /tmp/tickyticker/tickytickertextual.lock
 PRODUCTION ?= 0
-HOST ?= 127.0.0.1
+HOST ?= 0.0.0.0
 PORT ?= 8000
 PUBLIC_URL ?=
 

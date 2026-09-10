@@ -164,7 +164,7 @@ def test_repeat_rerun_cancel_preserves_results_and_downloads_no_files(tmp_path, 
             await pilot.press("escape")
             assert app.accepted_fit is fit and app.tic_states[path] is held
             for _ in range(2):
-                app._request_main_redo()
+                await pilot.click("#redo-analysis")
                 await pilot.pause()
                 await pilot.click("#settings-save")
                 for _ in range(100):
@@ -172,7 +172,9 @@ def test_repeat_rerun_cancel_preserves_results_and_downloads_no_files(tmp_path, 
                     if not app._analysis_running:
                         break
                 assert isinstance(app.screen, ChargeScanScreen)
+                assert len(app.screen_stack) == 2
                 review = app.screen
+                assert not review.query("#scan-svg")
                 await pilot.press("right")
                 assert review.query_one("#scan-tabs", TabbedContent).active == "scan-histogram"
                 app.open_review_plot(review, download=True)
@@ -181,7 +183,9 @@ def test_repeat_rerun_cancel_preserves_results_and_downloads_no_files(tmp_path, 
                 await pilot.press("left")
                 app.open_review_plot(review)
                 assert delivered[-1][1]["mime_type"] == "text/html"
-                await pilot.press("y")
+                await pilot.click("#scan-yes")
+                await pilot.pause()
+                assert len(app.screen_stack) == 1
                 for _ in range(100):
                     await pilot.pause()
                     if not app._tic_running:
@@ -205,7 +209,7 @@ def test_xml_volume_and_range_migration(tmp_path):
     settings_file.write_text('[charge_regions]\nmz_min=100\nmz_max=1700\nborder_mz_left=400\nborder_mz_right=1100\n')
     settings = load_algorithm_settings(settings_file)
     assert (settings.mz_min, settings.mz_max) == (400,1100)
-    assert "border_mz" not in settings_file.read_text()
+    assert "border_mz_left=400" in settings_file.read_text()
     assert settings.analysis_arguments()["border_mz_left"] == 400
 
 
@@ -333,3 +337,33 @@ def test_raw_tic_respects_range_and_shared_frame_selection(tmp_path, monkeypatch
     assert list(result.raw_tic_per_frame) == [50,50]
     assert list(result.tic_below_line_per_frame) == [40,40]
     assert result.tic_above_line == 0
+
+
+def test_actions_follow_available_data_and_production_suppresses_toasts(tmp_path):
+    async def exercise():
+        app = FileViewerApp(tmp_path, production=True)
+        async with app.run_test(size=(190, 50)) as pilot:
+            assert not app._browser_actions()["chromatograms"]
+            assert app.query_one("#open-tic-plot", Button).disabled
+            assert app.query_one("#redo-analysis", Button).disabled
+            app.notify("Selected folder")
+            assert not app._notifications
+            path = make_dataset(tmp_path, "hela.d", "HeLa")
+            app.selected_paths = [path]
+            app.chosen_path = path
+            settings = AlgorithmSettings()
+            app.accepted_fit = adapt_charge_scan_result(_fake_charge_result(settings), settings)
+            app.tic_states[path] = DatasetTicState(status="complete", tic_below_line=100, tic_above_line=200)
+            app._update_analysis_actions()
+            assert app.query_one("#open-tic-plot", Button).disabled
+            assert not app.query_one("#redo-analysis", Button).disabled
+            app.tic_states[path] = DatasetTicState(status="complete", tic_below_line=100, tic_above_line=200,
+                                                   result=_fake_tic_result(settings))
+            app._update_analysis_actions()
+            assert not app.query_one("#open-tic-plot", Button).disabled
+            app._tic_running = True
+            app._update_analysis_actions()
+            assert app.query_one("#open-tic-plot", Button).disabled
+            assert app.query_one("#redo-analysis", Button).disabled
+            app._tic_running = False
+    asyncio.run(exercise())

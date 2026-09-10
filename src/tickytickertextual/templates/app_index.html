@@ -15,6 +15,28 @@
         window.WebSocket = new Proxy(NativeWebSocket, {
           construct(target, args) {
             const socket = new target(...args);
+            socket.addEventListener('message', event => {
+              if (typeof event.data !== 'string') return;
+              let message;
+              try { message = JSON.parse(event.data); } catch (_) { return; }
+              if (message[0] !== 'open_url' || !message[1].url.startsWith('/plots/')) return;
+              event.stopImmediatePropagation();
+              const url = message[1].url;
+              if (url.includes('download=1')) {
+                const link = document.createElement('a');
+                link.href = url; link.download = ''; link.click();
+              } else if (window.pendingPlotWindow && !window.pendingPlotWindow.closed) {
+                window.pendingPlotWindow.location.href = url;
+                window.pendingPlotWindow = null;
+              } else {
+                const viewer = window.open(url, '_blank');
+                if (!viewer) {
+                  const link = document.getElementById('plot-link');
+                  link.href = url; link.hidden = false;
+                  exportStatus('Click Open plot');
+                }
+              }
+            });
             if (String(args[0]).includes("/ws")) {
               appSocket = socket;
               // Textual may send focus/resize before its WebSocket opens.
@@ -175,8 +197,19 @@
         display: flex;
       }
 
+      #session-controls {
+        position: fixed; left: 8px; bottom: 0; z-index: 50;
+        display: flex; align-items: center; height: 40px;
+        color: #ff7b72; background: #0c181f; font: 12px monospace;
+      }
+      #session-controls button {
+        margin: 0 8px 0 0; padding: 6px 12px; font: inherit;
+        background: #161b22; border: 1px solid #ff7b72;
+      }
+
       #export-toolbar {
         position: fixed;
+        left: 150px;
         right: 8px;
         bottom: 0;
         z-index: 40;
@@ -210,6 +243,7 @@
       }
 
       #terminal { height: calc(100vh - 42px); }
+      #export-toolbar { overflow-x: auto; white-space: nowrap; }
       #export-toolbar button:enabled { color: #ff7b72; }
       #export-toolbar button:disabled { color: #777; border-color: #555; cursor: default; }
       body.-closed #export-toolbar { display: none; }
@@ -225,6 +259,23 @@
         const params = new URLSearchParams(url.search);
         params.delete("delay");
         return url.pathname + "?" + params.toString();
+      }
+      async function restartApp() {
+        const button = document.getElementById('restart-app');
+        const status = document.getElementById('restart-status');
+        button.disabled = true;
+        status.textContent = 'Restarting…';
+        try {
+          const response = await fetch('/restart', {
+            method: 'POST',
+            headers: {'X-Restart-Token': document.body.dataset.restartToken},
+          });
+          if (!response.ok) throw new Error('Restart failed; try again');
+          window.location.replace(getStartUrl());
+        } catch (error) {
+          status.textContent = error.message;
+          button.disabled = false;
+        }
       }
       async function refresh() {
         const ping_url = document.body.dataset.pingurl;
@@ -243,13 +294,35 @@
         status.style.color = error ? "#ff7b72" : "#8be9fd";
       }
 
+      async function runAppAction(action) {
+        if (action === 'chromatograms') {
+          window.pendingPlotWindow = window.open('about:blank', '_blank');
+          if (window.pendingPlotWindow) window.pendingPlotWindow.document.body.textContent = 'Loading chromatograms…';
+        }
+        try {
+          const response = await fetch('/action', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json', 'X-Restart-Token': document.body.dataset.restartToken},
+            body: JSON.stringify({action}),
+          });
+          if (!response.ok) throw new Error('Action unavailable; try again');
+          focusTerminal();
+        } catch (error) {
+          if (window.pendingPlotWindow) window.pendingPlotWindow.close();
+          window.pendingPlotWindow = null;
+          exportStatus(error.message, true);
+        }
+      }
       async function updateExportButtons() {
-        let ready = false;
+        let state = {ready: false, actions: {}};
         try {
           const response = await fetch('/exports/status', {cache:'no-store'});
-          ready = response.ok && (await response.json()).ready;
+          if (response.ok) state = await response.json();
         } catch (_) {}
-        document.querySelectorAll('#export-toolbar button').forEach(button => button.disabled = !ready);
+        document.querySelectorAll('#export-toolbar button[data-export]').forEach(button => button.disabled = !state.ready);
+        document.querySelectorAll('#export-toolbar button[data-action]').forEach(button => {
+          button.disabled = !state.actions?.[button.dataset.action];
+        });
       }
       window.addEventListener('DOMContentLoaded', () => {
         updateExportButtons(); setInterval(updateExportButtons, 1000);
@@ -297,12 +370,21 @@
       }
     </script>
   </head>
-  <body data-pingurl="{{ ping_url }}">
+  <body data-pingurl="{{ ping_url }}" data-restart-token="{{ restart_token }}">
+    <div id="session-controls">
+      <button type="button" id="restart-app" onclick="restartApp()"
+        title="Clear selections and results, stop calculations, and start a fresh session">Restart app</button>
+      <span id="restart-status" role="status"></span>
+    </div>
     <div id="export-toolbar">
-      <button type="button" disabled onclick="copySelectedTable()">Copy table</button>
-      <button type="button" disabled onclick="downloadExport('selected.csv')">Save table</button>
-      <button type="button" disabled onclick="downloadExport('raw-tics.csv')">Raw TIC CSV</button>
+      <button type="button" disabled data-action="chromatograms" onclick="runAppAction('chromatograms')">See Chromatograms</button>
+      <button type="button" disabled data-action="rerun" onclick="runAppAction('rerun')">Rerun</button>
+      <button type="button" disabled data-action="tic-new" onclick="runAppAction('tic-new')">TIC new folders</button>
+      <button type="button" disabled data-export onclick="copySelectedTable()">Copy table</button>
+      <button type="button" disabled data-export onclick="downloadExport('selected.csv')">Save table</button>
+      <button type="button" disabled data-export onclick="downloadExport('raw-tics.csv')">Raw TIC CSV</button>
       <span id="export-status"></span>
+      <a id="plot-link" hidden target="_blank" rel="noopener">Open plot</a>
     </div>
     <div class="dialog-container intro-dialog">
       <div class="shade"></div>
@@ -330,7 +412,7 @@
       <div class="shade"></div>
       <div class="intro">
         <div class="message">Session ended.</div>
-        <button type="button" onClick="refresh()">Restart</button>
+        <button type="button" onClick="restartApp()">Restart</button>
       </div>
     </div>
 

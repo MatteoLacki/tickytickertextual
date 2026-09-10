@@ -1,1 +1,3 @@
-make web HOST=0.0.0.0
+#!/bin/sh
+cd -- "$(dirname -- "$0")" || exit 1
+exec make web PRODUCTION=1 "$@"

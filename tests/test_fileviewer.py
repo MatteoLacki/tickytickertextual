@@ -439,7 +439,7 @@ def test_dot_d_selection_focus_choose_and_remove(tmp_path: Path) -> None:
                 "Hidden",
                 "Folders only",
                 "Filter",
-                "Reload",
+                "Refresh folders",
                 "Help",
                 "Quit",
             } <= shown_descriptions()
@@ -939,8 +939,10 @@ def test_analysis_error_advice_covers_invalid_settings() -> None:
 
 
 
-def test_settings_window_saves_validated_toml(tmp_path: Path) -> None:
-    settings_path = tmp_path / ".server" / "settings.toml"
+def test_settings_edits_are_session_only(tmp_path: Path) -> None:
+    settings_path = tmp_path / "defaults.toml"
+    original = "[charge_regions]\nmz_min = 350.0\nmz_max = 1200.0\nmin_intensity = 31.0\n"
+    settings_path.write_text(original)
 
     async def exercise() -> None:
         app = FileViewerApp(tmp_path, settings_path=settings_path)
@@ -963,12 +965,18 @@ def test_settings_window_saves_validated_toml(tmp_path: Path) -> None:
             assert app.algorithm_settings.mz_max == 1600.0
             assert app.algorithm_settings.min_intensity == 42.5
             loaded = load_algorithm_settings(settings_path)
-            assert loaded.mz_min == 150.0
-            assert loaded.mz_max == 1600.0
-            assert loaded.min_intensity == 42.5
-            assert "[charge_regions]" in settings_path.read_text()
-            assert "mz_min = 150.0" in settings_path.read_text()
-            assert "mz_max = 1600.0" in settings_path.read_text()
+            assert loaded.mz_min == 350.0
+            assert loaded.mz_max == 1200.0
+            assert loaded.min_intensity == 31.0
+            assert settings_path.read_text() == original
+            app.action_show_settings()
+            await pilot.pause()
+            await pilot.click("#settings-defaults")
+            assert app.screen.query_one("#setting-min_intensity", Input).value == "31.0"
+            await pilot.press("escape")
+        fresh = FileViewerApp(tmp_path, settings_path=settings_path)
+        assert fresh.algorithm_settings == loaded
+        assert fresh.selected_paths == [] and fresh.accepted_fit is None
 
     asyncio.run(exercise())
 
@@ -991,8 +999,8 @@ frame_stride = 5
     assert settings.mz_min == 350.0
     assert settings.mz_max == 1200.0
     migrated = settings_path.read_text()
-    assert "mz_min = 350.0" in migrated
-    assert "mz_max = 1200.0" in migrated
+    assert "mz_min" not in migrated
+    assert "mz_max" not in migrated
     assert "min_intensity = 42.0" in migrated
     assert "frame_stride = 5" in migrated
 

@@ -1,0 +1,13 @@
+# Startup defaults. UI changes apply only to the current session.
+[charge_regions]
+mz_min = 350.0
+mz_max = 1200.0
+rt_min = 0.0
+rt_max = inf
+min_intensity = 30.0
+frame_stride = 1
+isotope_count = 3
+mobility_bins = 100
+mz_bin_width = 10.0
+threads = 3
+scans_per_mobility_bin = 0

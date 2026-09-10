@@ -236,35 +236,11 @@ def settings_to_toml(settings: AlgorithmSettings) -> str:
     return chr(10).join(lines) + chr(10)
 
 
-def save_algorithm_settings(path: Path, settings: AlgorithmSettings) -> None:
-    """Atomically replace the server-side TOML settings file."""
-    settings.validate()
-    path = path.expanduser()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    file_descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent, text=True
-    )
-    temporary_path = Path(temporary_name)
-    try:
-        with os.fdopen(file_descriptor, "w") as handle:
-            handle.write(settings_to_toml(settings))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary_path, path)
-    finally:
-        try:
-            temporary_path.unlink()
-        except FileNotFoundError:
-            pass
-
-
 def load_algorithm_settings(path: Path) -> AlgorithmSettings:
-    """Load settings from TOML, creating the defaults on first use."""
+    """Read default settings without creating, migrating or modifying files."""
     path = path.expanduser()
     if not path.exists():
-        settings = AlgorithmSettings()
-        save_algorithm_settings(path, settings)
-        return settings
+        return AlgorithmSettings()
     try:
         with path.open("rb") as handle:
             document = tomllib.load(handle)
@@ -294,8 +270,6 @@ def load_algorithm_settings(path: Path) -> AlgorithmSettings:
             values[name] = float(raw_value)
     settings = AlgorithmSettings(**values)
     settings.validate()
-    if legacy or {"mz_min", "mz_max", "rt_min", "rt_max"} - section.keys():
-        save_algorithm_settings(path, settings)
     return settings
 
 
@@ -1386,7 +1360,7 @@ class CurrentOptionList(OptionList):
             key_display="Ctrl+.",
         ),
         Binding("/", "app.show_filter", "Filter"),
-        Binding("r", "app.reload", "Reload"),
+        Binding("r", "app.reload", "Refresh folders"),
         Binding("H,shift+h", "app.show_help", "Help", key_display="Shift+H"),
     ]
 
@@ -1778,7 +1752,6 @@ class ChargeScanScreen(ModalScreen[ChargeScanResult | None]):
                 with TabPane("Fit parameters", id="scan-fit"):
                     yield Static(id="scan-fit-parameters", markup=False)
             with Horizontal(id="scan-buttons"):
-                yield Button("Open hi-res SVG", id="scan-svg")
                 yield Button("Download hi-res SVG", id="scan-download")
                 yield Button("Edit parameters", id="scan-redo")
                 yield Button("Reject", id="scan-no", variant="error")
@@ -1808,9 +1781,9 @@ class ChargeScanScreen(ModalScreen[ChargeScanResult | None]):
             self.post_message(self.ScanRequested(self))
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id in {"scan-svg", "scan-download"}:
+        if event.button.id == "scan-download":
             event.stop()
-            self.app.open_review_plot(self, download=event.button.id == "scan-download")
+            self.app.open_review_plot(self, download=True)
             return
         if event.button.id == "scan-redo":
             if self.state == "review":
@@ -1826,7 +1799,7 @@ class ChargeScanScreen(ModalScreen[ChargeScanResult | None]):
     ) -> None:
         if event.tabbed_content.id != "scan-tabs":
             return
-        for button_id in ("scan-svg", "scan-download"):
+        for button_id in ("scan-download",):
             self.query_one(f"#{button_id}", Button).disabled = event.tabbed_content.active == "scan-fit"
         for plot in event.pane.query(AnalysisPlot):
             plot.call_after_refresh(plot.redraw)
@@ -1840,6 +1813,7 @@ class ChargeScanScreen(ModalScreen[ChargeScanResult | None]):
             self.show_loading()
             self.post_message(self.ScanRequested(self))
         elif self.state == "review" and self.result is not None:
+            self.state = "accepted"
             self.dismiss(self.result)
 
     def show_loading(self) -> None:
@@ -1847,7 +1821,7 @@ class ChargeScanScreen(ModalScreen[ChargeScanResult | None]):
         self.query_one("#scan-question", Static).styles.display = "none"
         self.query_one("#scan-tabs", TabbedContent).styles.display = "none"
         self.query_one("#scan-loading", Static).styles.display = "block"
-        self.query_one("#scan-svg", Button).styles.display = "none"
+        self.query_one("#scan-download", Button).styles.display = "none"
         self.query_one("#scan-redo", Button).styles.display = "none"
         self.query_one("#scan-yes", Button).disabled = True
         self.query_one("#scan-no", Button).disabled = True
@@ -1890,9 +1864,6 @@ class ChargeScanScreen(ModalScreen[ChargeScanResult | None]):
         self.query_one("#scan-title", Static).update(
             "Review the fitted 1+/multicharge separator"
         )
-        svg_button = self.query_one("#scan-svg", Button)
-        svg_button.styles.display = "block"
-        svg_button.disabled = False
         self.query_one("#scan-download", Button).styles.display = "block"
         self.query_one("#scan-redo", Button).styles.display = "block"
         reject = self.query_one("#scan-no", Button)
@@ -2035,7 +2006,7 @@ class AnalysisErrorScreen(ModalScreen[None]):
 
 
 class SettingsScreen(ModalScreen[AlgorithmSettings | None]):
-    """Edit the persisted charge-regions algorithm configuration."""
+    """Edit the session charge-regions algorithm configuration."""
 
     CSS = """
     SettingsScreen {
@@ -2110,15 +2081,10 @@ class SettingsScreen(ModalScreen[AlgorithmSettings | None]):
         self.run_analysis = run_analysis
 
     def compose(self) -> ComposeResult:
-        path_text = (
-            str(self.settings_path)
-            if self.settings_path is not None
-            else "session-only settings"
-        )
         with Container(id="settings-dialog"):
             yield Static("Configure and run charge separation" if self.run_analysis else "charge-regions settings", id="settings-title")
             yield Static(
-                f"TOML: {path_text}\n"
+                "Changes apply to this session only; Restart app reloads defaults.\n"
                 "Comparison m/z bounds apply to every fit and TIC pass; "
                 "dataset acquisition bounds are shown separately.",
                 id="settings-path",
@@ -2148,7 +2114,7 @@ class SettingsScreen(ModalScreen[AlgorithmSettings | None]):
             with Horizontal(id="settings-buttons"):
                 yield Button("Defaults", id="settings-defaults")
                 yield Button("Reject" if self.run_analysis else "Cancel", id="settings-cancel")
-                yield Button("Calculate" if self.run_analysis else "Save", id="settings-save", variant="primary")
+                yield Button("Calculate" if self.run_analysis else "Apply", id="settings-save", variant="primary")
 
     def on_mount(self) -> None:
         self.query_one("#setting-mz_min", Input).focus()
@@ -2157,7 +2123,7 @@ class SettingsScreen(ModalScreen[AlgorithmSettings | None]):
         if event.button.id == "settings-save":
             self._save()
         elif event.button.id == "settings-defaults":
-            defaults = AlgorithmSettings()
+            defaults = self.app.default_algorithm_settings
             for name, _, _ in SETTING_DEFINITIONS:
                 value = getattr(defaults, name)
                 self.query_one(f"#setting-{name}", Input).value = str(
@@ -2442,7 +2408,7 @@ class HelpScreen(ModalScreen[None]):
   Ctrl+.            toggle folders-only mode (on initially)
   /                 filter current names with a shell glob
                     (empty input clears the filter)
-  r                 reload
+  r                 refresh folder listing
 
 [b].d datasets[/b]
   Current row       show cached Gradient and Volume; one line per folder
@@ -2462,7 +2428,7 @@ class HelpScreen(ModalScreen[None]):
   Calculate         fit in the popup, then review dominant-charge map,
                     scalable histogram, curve parameters, and hi-res SVG
   Left/Right        switch review panels (documented in the popup footer)
-  Open/Download SVG use the active plot; no server plot files are created
+  Download SVG saves the active plot; no server plot files are created
   Accept fit        run thresholded below/above TIC for every selected path
                     then normalize by the mean of enabled successful HeLas
   Rerun             edit parameters and repeat fitting and every TIC calculation
@@ -2636,7 +2602,7 @@ class FileViewerShell(App[None]):
             show=False,
         ),
         Binding("/", "show_filter", "Filter", show=False),
-        Binding("r", "reload", "Reload", show=False),
+        Binding("r", "reload", "Refresh folders", show=False),
         Binding("q", "quit", "Quit"),
     ]
 
@@ -2680,6 +2646,7 @@ class FileViewerShell(App[None]):
             if self.settings_path is not None
             else AlgorithmSettings()
         )
+        self.default_algorithm_settings = self.algorithm_settings
         self._analysis_running = False
 
     def compose(self) -> ComposeResult:
@@ -2854,19 +2821,9 @@ class FileViewerShell(App[None]):
     ) -> None:
         if settings is None:
             return
-        try:
-            if self.settings_path is not None:
-                save_algorithm_settings(self.settings_path, settings)
-        except (OSError, ConfigurationError) as error:
-            self.notify(f"Cannot save settings: {error}", severity="error")
-            return
+        settings.validate()
         self.algorithm_settings = settings
-        location = (
-            str(self.settings_path)
-            if self.settings_path is not None
-            else "this session"
-        )
-        self.notify(f"Algorithm settings saved to {location}")
+        self.notify("Algorithm settings applied to this session")
 
     def action_focus_selected_pane(self) -> None:
         self._focus_selected()
@@ -3873,8 +3830,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--settings",
         type=Path,
-        default=Path("/tmp/tickyticker/settings.toml"),
-        help="server-side charge-regions TOML settings file",
+        default=Path(__file__).with_name("defaults.toml"),
+        help="read-only TOML defaults loaded for each session",
     )
     parser.add_argument(
         "--lock-file",

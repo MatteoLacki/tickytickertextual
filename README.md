@@ -18,7 +18,7 @@ metadata is cached and reused if the dataset is added to `:selected:`. Once
 loaded, gradient length also appears in the aligned current-pane row. The app does not
 decode or preview filesystem images.
 Tickyticker results are rendered separately as responsive terminal-native
-ASCII views, with an optional high-resolution SVG for the dominant-charge map.
+ASCII views, with a high-resolution SVG download for each plot.
 
 ## Charge-area analysis
 
@@ -46,7 +46,7 @@ line and parameter snapshot only for those additions. New HeLas update every
 relative value at completion. Removing datasets is disabled/grey during TIC work.
 
 Left/right arrows switch review panels; the footer documents the bindings.
-Both dominant-charge and event-histogram views resize vertically. Open/download
+Both dominant-charge and event-histogram views resize vertically. Download
 SVG acts on the active plot. **See Chromatograms** opens a single scalable,
 vertically stacked figure labelled with each folder name and Description.
 
@@ -57,21 +57,24 @@ choosing another `.d` dataset or increasing frame/scan coverage in settings.
 
 The UI imports `tickyticker.charge_regions.analyse()` and
 `analyse_line_tic()` as package APIs. Their in-memory results avoid NPZ, JSON,
-PNG, and log-file round trips. SVGs stream from memory through Textual's native
-single-use delivery URLs. Viewer tabs have their own Download SVG button; no
+PNG, and log-file round trips. Plots are published to the web server in memory and served directly over HTTP,
+so downloads do not depend on the terminal connection. The latest document for
+each plot/format is retained until replacement or session restart. Viewer tabs have their own Download SVG button; no
 server plot files, expiry timers, or persistent browser storage are required.
 The regular
 tickyticker CLIs remain available for deliberate archival runs.
 
-Enter on a HeLa or press **Rerun** to edit parameters. They are validated and atomically
-stored in `/tmp/tickyticker/settings.toml` by default. A Linux `flock` held at
+Enter on a HeLa or press **Rerun** to edit parameters, then **Calculate** to run.
+Edits are validated and apply only to the current session. Each new session reads
+`src/tickytickertextual/defaults.toml` (or the file supplied with `SETTINGS` / `--settings`).
+The app never writes to that file. **Defaults** restores the startup values;
+**Restart app** discards all edits and reloads the defaults file. A Linux `flock` held at
 `/tmp/tickyticker/tickytickertextual.lock` permits only one active UI session;
 the kernel releases it automatically when that process exits.
 
 Only `mz_min` and `mz_max` are exposed, defaulting to 350–1200. This range applies
 to fitting and all TICs, including unthresholded raw TIC. Legacy TOML files use
-their former border limits as the new range and are rewritten without border
-settings. `rt_min`, `rt_max`, and `frame_stride` are shared by fit and TIC passes.
+their former border limits as the new range in memory; the file stays unchanged. `rt_min`, `rt_max`, and `frame_stride` are shared by fit and TIC passes.
 Frame stride samples MS1 frames after retention-time filtering; TICs are not
 scaled to estimate skipped frames.
 
@@ -82,8 +85,12 @@ Unread metadata shows `...`; missing or invalid Gradient or Volume shows red `NA
 A dataset cannot be selected unless both fields are available.
 Full paths remain available in the preview; selected rows show only folder names.
 
-The browser's **Copy table**, **Save table**, and **Raw TIC CSV** buttons sit below
-the selection. They are grey before results/during calculation and red when ready.
+The browser's **Restart app** button is always available, including during a
+calculation or after a session ends. It stops the old app process and starts a
+fresh session, clearing selections, fits, TIC results and exports. Session parameter edits are discarded and startup defaults are reloaded. `r` only refreshes the folder listing.
+
+The browser's **Copy table**, **Save table**, and **Raw TIC CSV** buttons sit beside
+**See Chromatograms** and **Rerun** in one row below the selection. They are grey before results/during calculation and red when ready.
 Copy and Save use the same full-precision nine-column data, never terminal text.
 Table exports are held in memory, not `/tmp`. `--production` suppresses toast
 notifications; progress and error panels remain available.
@@ -107,13 +114,17 @@ Run the same interface in a browser:
 make web DIRECTORY=/path/to/browse
 ```
 
-Then open <http://127.0.0.1:8000>. To listen on the network, pass
-`--host 0.0.0.0`, but put the service behind authentication and HTTPS or a
-trusted VPN first.
+Then open <http://127.0.0.1:8000> on the VM, or `http://<VM-IP>:8000`
+from another computer. `make web` listens on all interfaces (`HOST=0.0.0.0`)
+by default; use `make web HOST=127.0.0.1` for local access only. Browser assets
+and the app connection use the address you opened. For a reverse proxy, set
+`PUBLIC_URL=https://your-app.example`. Use a trusted network or VPN, or put
+the service behind authentication and HTTPS.
 
 The Make targets default to `/mnt/bigssd/tickyticker/data`. Override the root,
 settings file or lock file with `DIRECTORY`, `SETTINGS`, or `LOCK_FILE`.
-Use `PRODUCTION=1` with Make to suppress toast notifications. The directory argument of the
+Use `PRODUCTION=1` with Make to suppress toast notifications. The `./webui`
+launcher enables this by default; use `./webui PRODUCTION=0` for development. The directory argument of the
 underlying `tickytickertextual` and
 `tickytickertextual-web` commands remains optional and defaults to the process
 current working directory. In this paired checkout, uv resolves `tickyticker`
