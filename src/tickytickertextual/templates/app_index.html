@@ -19,6 +19,11 @@
               if (typeof event.data !== 'string') return;
               let message;
               try { message = JSON.parse(event.data); } catch (_) { return; }
+              if (message[0] === 'toolbar_state') {
+                event.stopImmediatePropagation();
+                applyExportState(message[1]);
+                return;
+              }
               if (message[0] !== 'open_url' || !message[1].url.startsWith('/plots/')) return;
               event.stopImmediatePropagation();
               const url = message[1].url;
@@ -57,6 +62,7 @@
           "keydown",
           (event) => {
             if (
+              !document.body.classList.contains("-welcome") &&
               event.ctrlKey &&
               !event.altKey &&
               !event.metaKey &&
@@ -77,6 +83,7 @@
         );
 
         const focusTerminal = () => {
+          if (document.body.classList.contains("-welcome")) return true;
           const textarea = document.querySelector(
             "#terminal .xterm-helper-textarea",
           );
@@ -197,63 +204,61 @@
         display: flex;
       }
 
-      #session-controls {
-        position: fixed; left: 8px; bottom: 0; z-index: 50;
-        display: flex; align-items: center; height: 40px;
-        color: #ff7b72; background: #0c181f; font: 12px monospace;
+      body { margin: 0; }
+      #terminal { height: calc(100vh - 48px); }
+      #browser-toolbar {
+        position: fixed; bottom: 0; left: 0; right: 0; height: 48px;
+        z-index: 50; display: grid; grid-template-columns: repeat(9, minmax(0, 1fr));
+        align-items: stretch; gap: 4px; padding: 4px; box-sizing: border-box;
+        background: #0c181f;
       }
-      #session-controls button {
-        margin: 0 8px 0 0; padding: 6px 12px; font: inherit;
-        background: #161b22; border: 1px solid #ff7b72;
-      }
-
-      #export-toolbar {
-        position: fixed;
-        left: 150px;
-        right: 8px;
-        bottom: 0;
-        z-index: 40;
-        display: none;
-        gap: 6px;
-        align-items: center;
-        padding: 4px 6px;
-        color: #c9d1d9;
-        background: rgba(13, 17, 23, 0.92);
-        border: 1px solid #30363d;
+      #browser-toolbar button {
+        min-width: 0; margin: 0; padding: 2px 4px;
+        color: #ff7b72; background: #161b22; border: 1px solid #ff7b72;
         font: 12px "Roboto Mono", menlo, monospace;
       }
-
-      body.-first-byte #export-toolbar {
-        display: flex;
+      #browser-toolbar button:hover:enabled { background: #1f6feb; }
+      #browser-toolbar button:disabled { color: #777; border-color: #555; cursor: default; }
+      #browser-status {
+        position: fixed; bottom: 48px; right: 8px; z-index: 50;
+        color: #8be9fd; background: #0c181f; font: 12px monospace;
       }
-
-      #export-toolbar button {
-        display: inline-block;
-        margin: 0;
-        padding: 4px 8px;
-        color: #c9d1d9;
-        background: #161b22;
-        border: 1px solid #ff7b72;
-        font: inherit;
+      #browser-status:has(span:not(:empty)), #browser-status:has(a:not([hidden])) { padding: 2px 6px; }
+      body.-welcome #terminal,
+      body.-welcome #browser-toolbar,
+      body.-welcome #browser-status { visibility: hidden; }
+      #welcome-dialog {
+        color: #8be9fd; background: #0d1117; border: 1px solid #30363d;
+        border-radius: 8px; padding: 24px; box-sizing: border-box;
+        max-width: 96vw; max-height: 96dvh; overflow: auto;
       }
-
-      #export-toolbar button:hover {
-        cursor: pointer;
-        background: #1f6feb;
+      #welcome-dialog::backdrop { background: #0c181f; }
+      #welcome-logo {
+        margin: 0; white-space: pre; text-align: left;
+        font-family: monospace; font-weight: normal;
+        font-size: min(10px, calc((96vw - 50px) / (var(--logo-columns) * 0.61)), calc((96dvh - 130px) / var(--logo-lines)));
+        line-height: 1;
       }
-
-      #terminal { height: calc(100vh - 42px); }
-      #export-toolbar { overflow-x: auto; white-space: nowrap; }
-      #export-toolbar button:enabled { color: #ff7b72; }
-      #export-toolbar button:disabled { color: #777; border-color: #555; cursor: default; }
-      body.-closed #export-toolbar { display: none; }
-
-      #export-status {
-        min-width: 5em;
-        color: #8be9fd;
+      #welcome-enter {
+        margin: 20px auto 0; padding: 12px 24px;
+        background: #161b22; color: #ff7b72; border: 1px solid #ff7b72;
+        font: 16px monospace;
       }
+      #welcome-enter:hover { background: #1f6feb; }
+      #welcome-enter:focus-visible { outline: 2px solid #8be9fd; outline-offset: 3px; }
     </style>
     <script>
+      function enterApp() {
+        document.getElementById('welcome-dialog').close();
+        document.body.classList.remove('-welcome');
+        focusTerminal();
+      }
+      window.addEventListener('DOMContentLoaded', () => {
+        const welcome = document.getElementById('welcome-dialog');
+        welcome.addEventListener('cancel', event => event.preventDefault());
+        welcome.showModal();
+        document.getElementById('welcome-enter').focus();
+      });
       function getStartUrl() {
         const url = new URL(window.location.href);
         const params = new URLSearchParams(url.search);
@@ -295,6 +300,10 @@
       }
 
       async function runAppAction(action) {
+        if (pendingActions.has(action)) return;
+        pendingActions.add(action);
+        renderExportButtons();
+        exportStatus(action === 'chromatograms' ? 'Preparing chromatograms…' : 'Opening…');
         if (action === 'chromatograms') {
           window.pendingPlotWindow = window.open('about:blank', '_blank');
           if (window.pendingPlotWindow) window.pendingPlotWindow.document.body.textContent = 'Loading chromatograms…';
@@ -307,11 +316,39 @@
           });
           if (!response.ok) throw new Error('Action unavailable; try again');
           focusTerminal();
+          exportStatus('');
         } catch (error) {
           if (window.pendingPlotWindow) window.pendingPlotWindow.close();
           window.pendingPlotWindow = null;
           exportStatus(error.message, true);
+        } finally {
+          await updateExportButtons();
+          pendingActions.delete(action);
+          renderExportButtons();
         }
+      }
+      const pendingActions = new Set();
+      let exportState = {ready: false, actions: {}};
+      const cooldownUntil = new WeakMap();
+      function renderExportButtons() {
+        document.querySelectorAll('button[data-export]').forEach(button => {
+          button.disabled = !exportState.ready || performance.now() < (cooldownUntil.get(button) || 0);
+        });
+        document.querySelectorAll('button[data-action]').forEach(button => {
+          button.disabled = pendingActions.has(button.dataset.action) || !exportState.actions?.[button.dataset.action];
+        });
+      }
+      function startExportCooldown(button) {
+        if (!button || button.disabled || performance.now() < (cooldownUntil.get(button) || 0)) return false;
+        cooldownUntil.set(button, performance.now() + 1000);
+        button.disabled = true;
+        setTimeout(renderExportButtons, 1000);
+        return true;
+      }
+      function applyExportState(state) {
+        if ((state.revision ?? -1) < (exportState.revision ?? -1)) return;
+        exportState = state;
+        renderExportButtons();
       }
       async function updateExportButtons() {
         let state = {ready: false, actions: {}};
@@ -319,16 +356,15 @@
           const response = await fetch('/exports/status', {cache:'no-store'});
           if (response.ok) state = await response.json();
         } catch (_) {}
-        document.querySelectorAll('#export-toolbar button[data-export]').forEach(button => button.disabled = !state.ready);
-        document.querySelectorAll('#export-toolbar button[data-action]').forEach(button => {
-          button.disabled = !state.actions?.[button.dataset.action];
-        });
+        applyExportState(state);
       }
       window.addEventListener('DOMContentLoaded', () => {
-        updateExportButtons(); setInterval(updateExportButtons, 1000);
+        updateExportButtons(); setInterval(updateExportButtons, 10000);
       });
 
-      async function copySelectedTable() {
+      async function copySelectedTable(button) {
+        if (!startExportCooldown(button)) return;
+        exportStatus("Copying…");
         try {
           const response = await fetch(`/exports/selected.tsv?t=${Date.now()}`, {
             cache: "no-store",
@@ -358,7 +394,8 @@
         }
       }
 
-      function downloadExport(filename) {
+      function downloadExport(filename, button) {
+        if (!startExportCooldown(button)) return;
         const link = document.createElement("a");
         link.href = `/exports/${filename}?t=${Date.now()}`;
         link.download = filename;
@@ -370,19 +407,26 @@
       }
     </script>
   </head>
-  <body data-pingurl="{{ ping_url }}" data-restart-token="{{ restart_token }}">
-    <div id="session-controls">
+  <body class="-welcome" data-pingurl="{{ ping_url }}" data-restart-token="{{ restart_token }}">
+    <dialog id="welcome-dialog" aria-label="Welcome to tickyticker">
+      <pre id="welcome-logo" role="img" aria-label="Tickyticker logo"
+        style="--logo-columns: {{ logo_columns }}; --logo-lines: {{ logo_lines }}">{{ welcome_logo | e }}</pre>
+      <button type="button" id="welcome-enter" onclick="enterApp()">oh my tickyticker</button>
+    </dialog>
+    <div id="browser-toolbar">
       <button type="button" id="restart-app" onclick="restartApp()"
         title="Clear selections and results, stop calculations, and start a fresh session">Restart app</button>
-      <span id="restart-status" role="status"></span>
-    </div>
-    <div id="export-toolbar">
+      <button type="button" disabled data-action="help" onclick="runAppAction('help')">Help</button>
+      <button type="button" disabled data-action="estimate" onclick="runAppAction('estimate')">Estimate charge split</button>
       <button type="button" disabled data-action="chromatograms" onclick="runAppAction('chromatograms')">See Chromatograms</button>
       <button type="button" disabled data-action="rerun" onclick="runAppAction('rerun')">Rerun</button>
       <button type="button" disabled data-action="tic-new" onclick="runAppAction('tic-new')">TIC new folders</button>
-      <button type="button" disabled data-export onclick="copySelectedTable()">Copy table</button>
-      <button type="button" disabled data-export onclick="downloadExport('selected.csv')">Save table</button>
-      <button type="button" disabled data-export onclick="downloadExport('raw-tics.csv')">Raw TIC CSV</button>
+      <button type="button" disabled data-export onclick="copySelectedTable(this)">Copy table</button>
+      <button type="button" disabled data-export onclick="downloadExport('selected.csv', this)">Save table</button>
+      <button type="button" disabled data-export onclick="downloadExport('raw-tics.csv', this)">Raw TIC CSV</button>
+    </div>
+    <div id="browser-status" role="status">
+      <span id="restart-status"></span>
       <span id="export-status"></span>
       <a id="plot-link" hidden target="_blank" rel="noopener">Open plot</a>
     </div>

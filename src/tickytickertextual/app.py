@@ -13,6 +13,7 @@ import re
 import stat
 import sqlite3
 import tempfile
+import time
 import traceback
 import tomllib
 import xml.etree.ElementTree as ET
@@ -35,7 +36,6 @@ from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widgets import (
     Button,
-    Footer,
     Header,
     Input,
     Label,
@@ -126,6 +126,8 @@ class AlgorithmSettings:
     border_mz_right: float = 1200.0
     threads: int = 3
     scans_per_mobility_bin: int = 0
+    target_amount_ng: float = 200.0
+    pm_qc_amount_ng: float = 100.0
 
     def __post_init__(self) -> None:
         # Compatibility attributes for core callers; there is one effective range.
@@ -133,6 +135,10 @@ class AlgorithmSettings:
         object.__setattr__(self, "border_mz_right", self.mz_max)
 
     def validate(self) -> None:
+        if not np.isfinite(self.pm_qc_amount_ng) or self.pm_qc_amount_ng <= 0:
+            raise ConfigurationError("PM QC amount must be finite and greater than zero")
+        if not np.isfinite(self.target_amount_ng) or self.target_amount_ng <= 0:
+            raise ConfigurationError("MM target amount must be finite and greater than zero")
         if not np.isfinite(self.mz_min) or not np.isfinite(self.mz_max):
             raise ConfigurationError("Comparison m/z limits must be finite")
         if self.mz_min >= self.mz_max:
@@ -233,6 +239,8 @@ def settings_to_toml(settings: AlgorithmSettings) -> str:
         value = getattr(settings, name)
         rendered = str(value) if value_type is int else repr(float(value))
         lines.append(f"{name} = {rendered}")
+    lines.extend(["", "[injection]", f"target_amount_ng = {float(settings.target_amount_ng)!r}",
+                  f"pm_qc_amount_ng = {float(settings.pm_qc_amount_ng)!r}"])
     return chr(10).join(lines) + chr(10)
 
 
@@ -268,7 +276,16 @@ def load_algorithm_settings(path: Path) -> AlgorithmSettings:
             if not isinstance(raw_value, (int, float)):
                 raise ConfigurationError(f"{name} must be numeric")
             values[name] = float(raw_value)
-    settings = AlgorithmSettings(**values)
+    injection = document.get("injection", {})
+    if not isinstance(injection, dict):
+        raise ConfigurationError(f"Invalid [injection] table in {path}")
+    target = injection.get("target_amount_ng", defaults.target_amount_ng)
+    if isinstance(target, bool) or not isinstance(target, (int, float)):
+        raise ConfigurationError("MM target amount must be numeric")
+    pm_amount = injection.get("pm_qc_amount_ng", defaults.pm_qc_amount_ng)
+    if isinstance(pm_amount, bool) or not isinstance(pm_amount, (int, float)):
+        raise ConfigurationError("PM QC amount must be numeric")
+    settings = AlgorithmSettings(**values, target_amount_ng=float(target), pm_qc_amount_ng=float(pm_amount))
     settings.validate()
     return settings
 
@@ -751,12 +768,12 @@ def tic_trace_svg(
             'fill="none" stroke="#f58518" stroke-width="2"/>',
             f'<polyline points="{points(raw, panel_tops[1], raw_max)}" '
             'fill="none" stroke="#54a24b" stroke-width="2"/>',
-            '<line x1="1160" y1="62" x2="1200" y2="62" stroke="#4c78a8" '
-            'stroke-width="4"/><text x="1210" y="68" fill="#c9d1d9" '
-            'font-size="17" font-family="monospace">below</text>',
+            '<line x1="1110" y1="62" x2="1150" y2="62" stroke="#4c78a8" '
+            'stroke-width="4"/><text x="1160" y="68" fill="#c9d1d9" '
+            'font-size="17" font-family="monospace">multicharge</text>',
             '<line x1="1310" y1="62" x2="1350" y2="62" stroke="#f58518" '
             'stroke-width="4"/><text x="1360" y="68" fill="#c9d1d9" '
-            'font-size="17" font-family="monospace">above</text>',
+            'font-size="17" font-family="monospace">singly charge</text>',
         ]
     )
     for tick_time in np.linspace(time_min, time_max, 6):
@@ -1687,6 +1704,11 @@ class ChargeScanScreen(ModalScreen[ChargeScanResult | None]):
         content-align: center middle;
     }
 
+    #scan-download-status {
+        height: 1;
+        color: #8be9fd;
+    }
+
     #scan-buttons {
         height: 3;
         align-horizontal: right;
@@ -1726,6 +1748,8 @@ class ChargeScanScreen(ModalScreen[ChargeScanResult | None]):
         self.result: ChargeScanResult | None = None
         self.svg_url: str | None = None
         self._loading_step = 0
+        self._download_ready_at = 0.0
+        self._download_busy = False
 
     def compose(self) -> ComposeResult:
         question = (
@@ -1751,12 +1775,12 @@ class ChargeScanScreen(ModalScreen[ChargeScanResult | None]):
                     yield AnalysisPlot("histogram", id="scan-histogram-plot")
                 with TabPane("Fit parameters", id="scan-fit"):
                     yield Static(id="scan-fit-parameters", markup=False)
+            yield Static(id="scan-download-status", markup=False)
             with Horizontal(id="scan-buttons"):
                 yield Button("Download hi-res SVG", id="scan-download")
                 yield Button("Edit parameters", id="scan-redo")
                 yield Button("Reject", id="scan-no", variant="error")
                 yield Button("Calculate", id="scan-yes", variant="primary")
-            yield Footer(compact=True)
 
     def action_previous_panel(self) -> None:
         self._move_panel(-1)
@@ -1783,6 +1807,11 @@ class ChargeScanScreen(ModalScreen[ChargeScanResult | None]):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "scan-download":
             event.stop()
+            if self.state != "review" or self._download_busy or time.monotonic() < self._download_ready_at:
+                return
+            self._download_ready_at = time.monotonic() + 1.0
+            self._update_download_button()
+            self.set_timer(1.0, self._update_download_button)
             self.app.open_review_plot(self, download=True)
             return
         if event.button.id == "scan-redo":
@@ -1799,10 +1828,21 @@ class ChargeScanScreen(ModalScreen[ChargeScanResult | None]):
     ) -> None:
         if event.tabbed_content.id != "scan-tabs":
             return
-        for button_id in ("scan-download",):
-            self.query_one(f"#{button_id}", Button).disabled = event.tabbed_content.active == "scan-fit"
+        self._update_download_button()
         for plot in event.pane.query(AnalysisPlot):
             plot.call_after_refresh(plot.redraw)
+
+    def set_download_status(self, busy: bool, message: str) -> None:
+        self._download_busy = busy
+        self.query_one("#scan-download-status", Static).update(message)
+        self.query_one("#scan-download", Button).label = "Preparing…" if busy else "Download hi-res SVG"
+        self._update_download_button()
+
+    def _update_download_button(self) -> None:
+        self.query_one("#scan-download", Button).disabled = (
+            self.state != "review" or self._download_busy or time.monotonic() < self._download_ready_at
+            or self.query_one("#scan-tabs", TabbedContent).active == "scan-fit"
+        )
 
     def action_decline(self) -> None:
         if self.state != "loading":
@@ -1874,6 +1914,7 @@ class ChargeScanScreen(ModalScreen[ChargeScanResult | None]):
         accept.label = "Accept fit"
         accept.variant = "success"
         accept.focus()
+        self._update_download_button()
 
     def reject_after_error(self) -> None:
         self._loading_timer.pause()
@@ -2147,7 +2188,8 @@ class SettingsScreen(ModalScreen[AlgorithmSettings | None]):
                     if name in {"rt_min", "rt_max"}
                     else value_type(raw_value)
                 )
-            settings = AlgorithmSettings(**values)
+            settings = AlgorithmSettings(**values, target_amount_ng=self.settings.target_amount_ng,
+                                         pm_qc_amount_ng=self.settings.pm_qc_amount_ng)
             settings.validate()
         except (ValueError, ConfigurationError) as error:
             self.query_one("#settings-error", Static).update(str(error))
@@ -2419,15 +2461,18 @@ class HelpScreen(ModalScreen[None]):
   Ctrl+Up           return focus to the filesystem pane
   Click             focus a row in :selected:
   Selected row      folder | Description | Gradient | Volume | QQ | QQ/HeLa
-                    | Q | Q/HeLa | Fit (scroll horizontally on narrow screens)
+                    | Q | Q/HeLa | Fit | Injection amount (scroll horizontally)
   j/k or arrows     move through selected paths
   g/G               jump to first/last selected path
   Blue rows         HeLa normalization group (auto-detected from Description)
   Space             toggle HeLa membership without starting analysis
-  Enter             choose blue HeLa as orange fitting reference; edit settings
+  Estimate charge split / Enter
+                    choose highlighted blue HeLa as fitting reference; edit settings
   Calculate         fit in the popup, then review dominant-charge map,
                     scalable histogram, curve parameters, and hi-res SVG
-  Left/Right        switch review panels (documented in the popup footer)
+  Left/Right        switch review panels
+  y                 accept the reviewed fit
+  n/Escape          reject the review when not calculating
   Download SVG saves the active plot; no server plot files are created
   Accept fit        run thresholded below/above TIC for every selected path
                     then normalize by the mean of enabled successful HeLas
@@ -2436,6 +2481,8 @@ class HelpScreen(ModalScreen[None]):
   See Chromatograms open all completed datasets in one stacked plot
   Reject/Cancel     preserve the previous completed analysis and selected paths
   x or click ×      remove the current path (disabled/grey during TIC processing)
+  Restart app       clear the session and reload defaults (button only)
+  Help              open this guide and the full keyboard reference
   Browser buttons   Copy table, Save table and Raw TIC CSV below the selection;
                     enabled/red once results are ready. Full precision exports.
   h                 return focus to the middle pane
@@ -2444,6 +2491,8 @@ class HelpScreen(ModalScreen[None]):
   m/z min/max       one range for fitting and TIC (defaults 350–1200)
   RT min/max        same retention interval for every fit and TIC
   Frame stride      every k-th MS1 frame for both fitting and TIC (no rescaling)
+  PM QC amount      editable calibration amount (default 100 ng)
+  MM target amount  editable target (default 200 ng); amounts update immediately
   --production      suppress notification popups; errors remain in their panels
 
 Shift+H opens this help. Escape or Close dismisses it. q quits."""
@@ -2453,6 +2502,13 @@ Shift+H opens this help. Escape or Close dismisses it. q quits."""
             yield Static("tickytickertextual help", id="help-title")
             yield Static(self.HELP_TEXT, id="help-content")
             yield Button("Close", id="help-close", variant="primary")
+
+    def on_mount(self) -> None:
+        self.query_one("#help-close", Button).focus()
+        self.app._publish_exports()
+
+    def on_unmount(self) -> None:
+        self.app.call_after_refresh(self.app._publish_exports)
 
     def action_close_help(self) -> None:
         self.dismiss()
@@ -2490,7 +2546,8 @@ class FileViewerShell(App[None]):
     }
 
     #panes {
-        height: 3fr;
+        height: 1fr;
+        min-height: 5;
     }
 
     .pane {
@@ -2562,8 +2619,26 @@ class FileViewerShell(App[None]):
     }
 
     #analysis-actions Button {
-        width: 24;
-        margin-left: 1;
+        width: 1fr;
+        min-width: 0;
+        margin-left: 0;
+    }
+
+    #injection-settings {
+        height: 3;
+        align-vertical: middle;
+    }
+    #injection-settings Label {
+        width: auto;
+        margin: 1 1 0 1;
+    }
+    #target-amount-ng, #pm-qc-amount-ng {
+        width: 14;
+    }
+    #target-error {
+        width: 1fr;
+        margin: 1 1 0 1;
+        color: #ff7b72;
     }
 
     #status-bar {
@@ -2669,7 +2744,6 @@ class FileViewerShell(App[None]):
             yield Button("Open RT/TIC plot", id="open-tic-plot", disabled=True)
             yield Button("Redo with different RT", id="redo-analysis", disabled=True)
         yield Static(id="status-bar")
-        yield Footer(compact=True)
 
     def on_mount(self) -> None:
         self.query_one("#parent-pane").border_title = "parent"

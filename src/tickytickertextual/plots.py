@@ -12,6 +12,7 @@ def svg_viewer_html(svg, filename):
     name = json.dumps(filename).replace("<", "\\u003c")
     return f'''<!doctype html><meta charset="utf-8"><title>{html.escape(filename)}</title>
 <style>body{{margin:0;background:#0d1117;color:white}}button{{position:sticky;top:0;padding:12px}}
+button:disabled{{opacity:0.5;cursor:default}}
 svg{{display:block;width:100%;height:auto}}</style>
 <button id="save">Download hi-res SVG</button><div id="plot"></div>
 <script>
@@ -19,7 +20,11 @@ const svgText = {payload};
 const parsed = new DOMParser().parseFromString(svgText, 'image/svg+xml');
 document.getElementById('plot').appendChild(document.importNode(parsed.documentElement, true));
 let downloadUrl;
-document.getElementById('save').onclick = () => {{
+const saveButton = document.getElementById('save');
+saveButton.onclick = () => {{
+  if (saveButton.disabled) return;
+  saveButton.disabled = true;
+  setTimeout(() => saveButton.disabled = false, 1000);
   if (!downloadUrl) downloadUrl = URL.createObjectURL(new Blob([svgText], {{type:'image/svg+xml'}}));
   const link = document.createElement('a'); link.href=downloadUrl; link.download={name}; link.click();
 }};

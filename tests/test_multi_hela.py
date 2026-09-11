@@ -103,6 +103,7 @@ def test_multi_hela_batch_incremental_and_zero_denominator(tmp_path, monkeypatch
             assert app._normalizers() == (35.0,12.5)
             rows = app._selected_export_rows()
             assert rows[-1][4:8] == (70,2.0,25,2.0)
+            assert rows[-1][-1] == "0.50"
             assert rows[0][5] == pytest.approx(20/35)
             assert rows[0][7] == .8
             assert app._results_ready()
@@ -123,6 +124,7 @@ def test_multi_hela_batch_incremental_and_zero_denominator(tmp_path, monkeypatch
             assert [p for p,_,_ in calls] == paths + [sample,later]
             assert all((low,high) == (350,1200) for _,low,high in calls)
             assert app._normalizers() == (40.0,15.0)
+            assert app._selected_export_rows()[-2][-1] == "0.57"
             assert not app.query_one("#tic-new", Button).display
             # Membership edits reuse absolute results.
             app.hela_paths = {paths[0]}
@@ -177,11 +179,11 @@ def test_repeat_rerun_cancel_preserves_results_and_downloads_no_files(tmp_path, 
                 assert not review.query("#scan-svg")
                 await pilot.press("right")
                 assert review.query_one("#scan-tabs", TabbedContent).active == "scan-histogram"
-                app.open_review_plot(review, download=True)
+                await app.open_review_plot(review, download=True).wait()
                 assert delivered[-1][1]["save_filename"] == "event-histogram.svg"
                 assert "Raw-event intensity histogram" in delivered[-1][0]
                 await pilot.press("left")
-                app.open_review_plot(review)
+                await app.open_review_plot(review).wait()
                 assert delivered[-1][1]["mime_type"] == "text/html"
                 await pilot.click("#scan-yes")
                 await pilot.pause()
@@ -191,7 +193,7 @@ def test_repeat_rerun_cancel_preserves_results_and_downloads_no_files(tmp_path, 
                     if not app._tic_running:
                         break
                 assert app._results_ready()
-            app._open_selected_tic_plot()
+            await app._open_selected_tic_plot().wait()
             assert "chromatograms.html" == delivered[-1][1]["save_filename"]
             assert not (tmp_path / "plots").exists()
 
@@ -297,7 +299,7 @@ def test_memory_export_server_readiness_and_precision(tmp_path):
         async with client:
             assert (await client.get("/exports/selected.csv")).status == 404
             assert (await client.post("/_publish", json={})).status == 403
-            rows = [("hela.d", "HéLa", "5m", "0.5 µl", 1234567890123456789, 1., 22, 1., "fit")]
+            rows = [("hela.d", "HéLa", "5m", "0.5 µl", 1234567890123456789, 1., 22, 1., "fit", "1.00")]
             csv_text = FileViewerApp._delimited_text(TABLE_HEADER, rows, delimiter=",")
             tsv_text = FileViewerApp._delimited_text(TABLE_HEADER, rows, delimiter="\t")
             response = await client.post("/_publish", headers={"Authorization":"Bearer test-secret"},
@@ -307,7 +309,7 @@ def test_memory_export_server_readiness_and_precision(tmp_path):
             copied = await (await client.get("/exports/selected.tsv")).text()
             assert list(csv.reader(io.StringIO(saved))) == list(csv.reader(io.StringIO(copied), delimiter="\t"))
             assert "1234567890123456789" in copied and "HéLa" in copied
-            assert len(next(csv.reader(io.StringIO(saved)))) == 9
+            assert len(next(csv.reader(io.StringIO(saved)))) == len(TABLE_HEADER) + 1
             await client.post("/_publish", headers={"Authorization":"Bearer test-secret"}, json={"ready":False})
             assert (await client.get("/exports/selected.csv")).status == 404
     asyncio.run(exercise())

@@ -35,7 +35,7 @@ tickytickertextual-web = "tickytickertextual.web:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-tickytickertextual = ["templates/*.html", "defaults.toml"]
+tickytickertextual = ["templates/*.html", "defaults.toml", "logoascii.txt"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

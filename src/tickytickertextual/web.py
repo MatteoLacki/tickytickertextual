@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import csv
+from datetime import date
+import io
+import json
 import secrets
 import shlex
 import sys
@@ -15,6 +19,16 @@ from aiohttp import web as aiohttp_web
 from textual_serve.server import Server
 
 from .session import BrowserAppService
+
+
+def _welcome_logo() -> str:
+    package = Path(__file__).resolve().parent
+    # Keep the user's repository artwork editable; include a copy in installations.
+    for path in (package.parent.parent / "logoascii.txt",
+                 package.parent.parent / "logoacsii.txt", package / "logoascii.txt"):
+        if path.is_file():
+            return path.read_text(encoding="utf-8")
+    return "tickyticker"
 
 
 class PlotServer(Server):
@@ -45,6 +59,7 @@ class PlotServer(Server):
         self._restart_token = secrets.token_urlsafe(32)
         self.documents = {}
         self.actions = {}
+        self._state_revision = 0
 
     async def on_startup(self, app):
         # The subprocess command contains the internal bridge credential.
@@ -63,7 +78,11 @@ class PlotServer(Server):
             font_size = int(request.query.get("fontsize", "16"))
         except ValueError:
             font_size = 16
+        logo = _welcome_logo()
         return {
+            "welcome_logo": logo,
+            "logo_columns": max((len(line) for line in logo.splitlines()), default=1),
+            "logo_lines": max(1, len(logo.splitlines())),
             "font_size": font_size,
             "restart_token": self._restart_token,
             "app_websocket_url": websocket_url,
@@ -88,6 +107,7 @@ class PlotServer(Server):
                 await service.start(dimension("width", 80), dimension("height", 24))
                 self._sessions[service] = socket
                 self._connected_uis = len(self._sessions)
+                await socket.send_str(json.dumps(["toolbar_state", self._toolbar_state()]))
             await self._process_messages(socket, service)
         finally:
             cleanup = asyncio.create_task(self._close_session(service, socket))
@@ -111,6 +131,7 @@ class PlotServer(Server):
         self.exports.clear()
         self.documents.clear()
         self.actions.clear()
+        self._state_revision += 1
 
     async def _restart(self, request):
         if not secrets.compare_digest(request.headers.get("X-Restart-Token", ""), self._restart_token):
@@ -129,7 +150,7 @@ class PlotServer(Server):
         if not secrets.compare_digest(request.headers.get("X-Restart-Token", ""), self._restart_token):
             raise aiohttp_web.HTTPForbidden()
         action = (await request.json()).get("action")
-        if action not in {"chromatograms", "rerun", "tic-new"}:
+        if action not in {"chromatograms", "rerun", "tic-new", "help", "estimate"}:
             raise aiohttp_web.HTTPBadRequest()
         async with self._session_lock:
             if not self.actions.get(action) or len(self._sessions) != 1:
@@ -177,19 +198,26 @@ class PlotServer(Server):
                     self.documents.pop(old_key)
             self.documents[key] = document
             return aiohttp_web.json_response({"url": f"/plots/{key}"})
-        exports = payload.get("exports", {})
+        exports = payload.get("exports", self.exports)
         if not isinstance(exports, dict) or any(k not in self.EXPORTS or not isinstance(v, str) for k, v in exports.items()):
             raise aiohttp_web.HTTPBadRequest()
         actions = payload.get("actions", {})
         if not isinstance(actions, dict):
             raise aiohttp_web.HTTPBadRequest()
-        self.actions = {key: bool(actions.get(key)) for key in ("chromatograms", "rerun", "tic-new")}
+        self.actions = {key: bool(actions.get(key)) for key in ("chromatograms", "rerun", "tic-new", "help", "estimate")}
         self.exports_ready = bool(payload.get("ready"))
         self.exports = exports if self.exports_ready else {}
+        self._state_revision += 1
+        message = json.dumps(["toolbar_state", self._toolbar_state()])
+        await asyncio.gather(*(socket.send_str(message) for socket in list(self._sessions.values())
+                               if not socket.closed), return_exceptions=True)
         return aiohttp_web.json_response({"ok": True})
 
+    def _toolbar_state(self):
+        return {"ready": self.exports_ready, "actions": self.actions, "revision": self._state_revision}
+
     async def _export_status(self, request):
-        return aiohttp_web.json_response({"ready": self.exports_ready, "actions": self.actions}, headers={"Cache-Control": "no-store"})
+        return aiohttp_web.json_response(self._toolbar_state(), headers={"Cache-Control": "no-store"})
 
     async def _download_export(
         self, request: aiohttp_web.Request
@@ -199,8 +227,15 @@ class PlotServer(Server):
             raise aiohttp_web.HTTPNotFound()
         if not self.exports_ready or filename not in self.exports:
             raise aiohttp_web.HTTPNotFound(text="Export is not ready yet")
+        delimiter = "\t" if filename.endswith("tsv") else ","
+        rows = csv.reader(io.StringIO(self.exports[filename]), delimiter=delimiter)
+        output = io.StringIO()
+        writer = csv.writer(output, delimiter=delimiter, lineterminator="\n")
+        writer.writerow(["Date", *next(rows)])
+        exported_on = date.today().strftime("%d.%m.%Y")
+        writer.writerows([exported_on, *row] for row in rows)
         return aiohttp_web.Response(
-            body=self.exports[filename].encode("utf-8"),
+            body=output.getvalue().encode("utf-8"),
             content_type="text/tab-separated-values" if filename.endswith("tsv") else "text/csv",
             charset="utf-8",
             headers={

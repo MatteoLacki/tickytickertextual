@@ -45,7 +45,8 @@ completed results. After adding more folders, **TIC new folders** uses the accep
 line and parameter snapshot only for those additions. New HeLas update every
 relative value at completion. Removing datasets is disabled/grey during TIC work.
 
-Left/right arrows switch review panels; the footer documents the bindings.
+Left/right arrows switch review panels. **Help**, beside **Restart app**, lists
+all keyboard shortcuts; keyboard footers are hidden.
 Both dominant-charge and event-histogram views resize vertically. Download
 SVG acts on the active plot. **See Chromatograms** opens a single scalable,
 vertically stacked figure labelled with each folder name and Description.
@@ -91,7 +92,7 @@ fresh session, clearing selections, fits, TIC results and exports. Session param
 
 The browser's **Copy table**, **Save table**, and **Raw TIC CSV** buttons sit beside
 **See Chromatograms** and **Rerun** in one row below the selection. They are grey before results/during calculation and red when ready.
-Copy and Save use the same full-precision nine-column data, never terminal text.
+Copy and Save use the same table values plus the export date, never terminal text.
 Table exports are held in memory, not `/tmp`. `--production` suppresses toast
 notifications; progress and error panels remain available.
 
@@ -131,7 +132,10 @@ current working directory. In this paired checkout, uv resolves `tickyticker`
 from the editable core repository two directories above the app, ensuring the
 RT/per-frame API matches the UI. Install this checkout layout before `make sync`.
 
-The status row reports state only. All primary commands are shown in the compact, styled footer, which changes when focus moves between the filesystem and `:selected:` panes.
+The status row reports state only. Use **Help** for the keyboard reference.
+**Estimate charge split**, beside Help, opens the fit parameters for the
+highlighted eligible HeLa in `:selected:`. It is disabled for other rows or
+while calculation is running.
 
 ## Keys
 
@@ -159,7 +163,52 @@ The status row reports state only. All primary commands are shown in the compact
 Navigation is confined to the root passed on the command line. Symlinks are
 displayed but never followed.
 
-The nine table/export columns are `Path`, `Description`, `Gradient`, `Volume`,
-`QQ`, `QQ / QQ-HeLa`, `Q`, `Q / Q-HeLa`, and `Fit Parameters`. Rows never wrap;
+The ten selected-table columns are `Path`, `Description`, `Gradient`, `Volume`,
+`QQ`, `QQ / QQ-HeLa`, `Q`, `Q / Q-HeLa`, `Fit Parameters`, and `Injection amount (µL)`. Rows never wrap;
 wide tables scroll horizontally. A path ending in `/e/f/g/folder.d` displays
 as `folder.d`. The separate raw CSV has per-frame RT, raw TIC, QQ and Q values.
+
+## Injection amount
+
+After TIC calculation, **Injection amount (µL)** is calculated as
+`ROUND((mean HeLa QQ / sample QQ) × (MM target ng / PM QC ng) × original injection volume in µL, 2)`.
+The reference is the same enabled, successfully processed HeLa group used for
+QQ normalization. The **MM target amount (ng)** field defaults to 200 and updates
+all injection amounts immediately without repeating the analysis. Changes last
+only for this session; restart reloads `[injection].target_amount_ng` from the
+defaults file. **PM QC amount (ng)** is also editable, defaults to 100, and
+updates the column immediately. It reloads from `[injection].pm_qc_amount_ng`
+on restart.
+
+The original volume comes from each dataset's XML metadata. µL/μL/uL, nL, mL
+and L are converted to µL. Results use spreadsheet-style rounding to two decimal
+places in both the table and CSV/TSV. Values remain blank while calculation is
+incomplete, or if QQ, HeLa reference, target, or volume is missing/invalid/zero,
+or the volume unit is unknown. Changing the enabled HeLa group or completing
+TIC for newly selected folders recomputes the column.
+
+Copied tables, selected-table CSV and raw TIC CSV include a leading `Date` column
+using the server-local export date in `dd.mm.yyyy` format. The date is added when
+the export is requested, including when a session remains open past midnight.
+
+Download buttons (table exports, review SVGs, and the chromatogram viewer)
+are disabled for at least one second after a click. Review SVG downloads stay
+disabled until background preparation and publication finish; only one plot is
+prepared at a time. The review shows progress or a retryable error. SVG generation
+and HTTP publication run outside the UI event loop. Copy table uses the same cooldown.
+Chromatogram legends label QQ as `multicharge` and Q as `singly charge`.
+
+The browser controls share one full-width row of equally sized buttons. Button
+availability is pushed over the existing connection when selection or app state
+changes; clicks immediately show feedback. Moving the selection reuses cached
+exports instead of rebuilding or uploading the CSV data.
+
+The `:current:` and `:selected:` regions share the available height equally.
+During TIC calculation, each queued row shows `Queued` in QQ, and the active
+row shows its processed frame count. Its final QQ replaces that progress on
+completion. Progress text is never included in exported tables.
+
+Each browser start and app restart opens a welcome window with the ASCII logo.
+Click `oh my tickyticker` to enter the file browser. The artwork is read from
+`logoascii.txt` in the app repository, or the existing `logoacsii.txt` spelling;
+installed packages also include a copy of the logo.

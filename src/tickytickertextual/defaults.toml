@@ -11,3 +11,7 @@ mobility_bins = 100
 mz_bin_width = 10.0
 threads = 3
 scans_per_mobility_bin = 0
+
+[injection]
+target_amount_ng = 200.0
+pm_qc_amount_ng = 100.0

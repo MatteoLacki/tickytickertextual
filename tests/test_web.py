@@ -141,3 +141,38 @@ def test_restart_terminates_unresponsive_session_and_releases_lock(tmp_path):
             assert next(iter(server._sessions))._process.pid != process.pid
             await new_socket.close()
     asyncio.run(exercise())
+
+
+def test_toolbar_updates_are_pushed_and_preserve_cached_exports():
+    import json
+    async def exercise():
+        script = "import time; print('__GANGLION__', flush=True); time.sleep(60)"
+        server = PlotServer(shlex.join([sys.executable, '-c', script]), bridge_token='secret')
+        async with TestClient(TestServer(await server._make_app())) as client:
+            async with client.ws_connect('/ws') as socket:
+                async def state_message():
+                    async with asyncio.timeout(2):
+                        while True:
+                            message = await socket.receive()
+                            if message.type == WSMsgType.TEXT:
+                                payload = json.loads(message.data)
+                                if payload[0] == 'toolbar_state':
+                                    return payload[1]
+                initial = await state_message()
+                headers = {'Authorization': 'Bearer secret'}
+                exports = {'selected.csv': 'Path,QQ\nhela.d,100\n'}
+                response = await client.post('/_publish', headers=headers, json={
+                    'ready': True, 'exports': exports, 'actions': {'estimate': True}})
+                assert response.status == 200
+                ready = await state_message()
+                assert ready['ready'] and ready['actions']['estimate']
+                assert ready['revision'] > initial['revision']
+                response = await client.post('/_publish', headers=headers, json={
+                    'ready': True, 'actions': {'estimate': False}})
+                assert response.status == 200
+                selected = await state_message()
+                assert not selected['actions']['estimate']
+                assert selected['revision'] > ready['revision']
+                assert server.exports == exports
+                assert 'hela.d,100' in await (await client.get('/exports/selected.csv')).text()
+    asyncio.run(exercise())

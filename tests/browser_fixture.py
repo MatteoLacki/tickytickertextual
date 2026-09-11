@@ -45,13 +45,29 @@ class BrowserFixture(FileViewerApp):
     def action_chrom_fixture(self):
         self._open_selected_tic_plot()
 
+    def open_review_plot(self, screen, download=False):
+        if not download:
+            return super().open_review_plot(screen, download)
+        import time
+        from dataclasses import replace
+        import numpy as np
+        from tickytickertextual.app import dominant_charge_svg
+        def render():
+            time.sleep(3)
+            result = replace(self.accepted_fit,
+                intensities=np.full((3, 150, 1000), 100.0),
+                mz_edges=np.linspace(350, 1200, 1001),
+                mobility_edges=np.linspace(.6, 1.6, 151))
+            return dominant_charge_svg(result)
+        return self._queue_plot(render, "dominant-charge.svg", True, screen)
+
     def action_dominant_fixture(self):
         from tickytickertextual.app import dominant_charge_svg
-        self._deliver_svg(dominant_charge_svg(self.accepted_fit), "dominant-charge.svg", True)
+        self._queue_plot(lambda: dominant_charge_svg(self.accepted_fit), "dominant-charge.svg", True)
 
     def action_download_fixture(self):
         from tickytickertextual.plots import event_histogram_svg
-        self._deliver_svg(event_histogram_svg(self.accepted_fit), "event-histogram.svg", True)
+        self._queue_plot(lambda: event_histogram_svg(self.accepted_fit), "event-histogram.svg", True)
 
 
 if __name__ == "__main__":

@@ -1,15 +1,18 @@
 """Analysis state and browser delivery, separate from the navigation shell."""
 from __future__ import annotations
 
+import asyncio
 import json
 import io
+from dataclasses import replace
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from urllib.request import Request, urlopen
 
 from rich.style import Style
 from rich.text import Text
 from textual.containers import Horizontal, Vertical
-from textual.widgets import Button, Footer, Header, Static
+from textual.widgets import Button, Header, Input, Label, Static
 
 from . import app as a
 from .browser_driver import BrowserAction
@@ -18,7 +21,7 @@ from .plots import combined_chromatograms_svg, event_histogram_svg
 
 TABLE_HEADER = (
     "Path", "Description", "Gradient", "Volume", "QQ", "QQ / QQ-HeLa",
-    "Q", "Q / Q-HeLa", "Fit Parameters",
+    "Q", "Q / Q-HeLa", "Fit Parameters", "Injection amount (µL)",
 )
 
 
@@ -32,7 +35,16 @@ class WorkflowMixin:
         self.hela_paths: set[Path] = set()
         self.hela_overrides: dict[Path, bool] = {}
         self._pending_reference = None
+        self._export_cache = {}
+        self._export_cache_ready = False
+        self._published_exports = None
+        self._tic_progress = {}
         self._last_publication = None
+        self._pending_publication = None
+        self._publication_worker = None
+        self._plot_delivery_busy = False
+        self._closing = False
+        self._target_amount_valid = True
         super().__init__(*args, **kwargs)
 
     def notify(self, message, **kwargs):
@@ -51,14 +63,21 @@ class WorkflowMixin:
         with Vertical(id="selected-region", classes="pane"):
             yield Static(id="selected-header", classes="table-header")
             yield a.SelectedOptionList(id="selected-pane", markup=False, compact=True)
+        with Horizontal(id="injection-settings"):
+            yield Label("QC: HeLa · PM QC amount (ng)")
+            yield Input(str(self.algorithm_settings.pm_qc_amount_ng), type="number", id="pm-qc-amount-ng")
+            yield Label("MM target amount (ng)")
+            yield Input(str(self.algorithm_settings.target_amount_ng), type="number", id="target-amount-ng")
+            yield Static(id="target-error")
         with Horizontal(id="analysis-actions"):
+            yield Button("Help", id="show-help")
+            yield Button("Estimate charge split", id="estimate-split", disabled=True)
             yield Button("See Chromatograms", id="open-tic-plot", disabled=True)
             yield Button("TIC new folders", id="tic-new", disabled=True)
             yield Button("Rerun", id="redo-analysis", disabled=True)
-        yield Static("Select a blue HeLa in :selected: and press Enter to set analysis parameters, then Calculate.",
+        yield Static("Highlight a blue HeLa in :selected:, click Estimate charge split, then Calculate.",
                      id="analysis-hint")
         yield Static(id="status-bar")
-        yield Footer(compact=True)
 
     def on_mount(self, event):
         event.prevent_default()
@@ -66,10 +85,38 @@ class WorkflowMixin:
         if self.bridge_url:
             self.query_one("#analysis-actions").display = False
 
+    def on_input_changed(self, event: Input.Changed):
+        if event.input.id not in {"target-amount-ng", "pm-qc-amount-ng"}:
+            return
+        event.stop()
+        try:
+            settings = replace(self.algorithm_settings,
+                               target_amount_ng=float(self.query_one("#target-amount-ng", Input).value),
+                               pm_qc_amount_ng=float(self.query_one("#pm-qc-amount-ng", Input).value))
+            settings.validate()
+        except (ValueError, a.ConfigurationError):
+            self._target_amount_valid = False
+            self.query_one("#target-error", Static).update("Enter amounts greater than zero")
+        else:
+            self._target_amount_valid = True
+            self.algorithm_settings = settings
+            self.query_one("#target-error", Static).update("")
+        self._refresh_selected_pane()
+
+    def _apply_algorithm_settings(self, settings):
+        super()._apply_algorithm_settings(settings)
+        if settings is not None:
+            self.query_one("#target-amount-ng", Input).value = str(self.algorithm_settings.target_amount_ng)
+            self.query_one("#pm-qc-amount-ng", Input).value = str(self.algorithm_settings.pm_qc_amount_ng)
+
     def on_browser_action(self, event: BrowserAction):
         if not self._browser_actions().get(event.action):
             return
-        if event.action == "chromatograms":
+        if event.action == "help":
+            self.action_show_help()
+        elif event.action == "estimate":
+            self.action_choose_reference()
+        elif event.action == "chromatograms":
             self._open_selected_tic_plot()
         elif event.action == "rerun":
             self._request_main_redo()
@@ -211,7 +258,11 @@ class WorkflowMixin:
     def on_button_pressed(self, event):
         event.prevent_default()
         event.stop()
-        if event.button.id == "tic-new":
+        if event.button.id == "show-help":
+            self.action_show_help()
+        elif event.button.id == "estimate-split":
+            self.action_choose_reference()
+        elif event.button.id == "tic-new":
             if self.accepted_fit is not None:
                 self._begin_tic_batch(self.accepted_fit, only_new=True)
         else:
@@ -227,10 +278,24 @@ class WorkflowMixin:
         self._tic_running = True
         if not only_new:
             self.tic_states.clear()
+            self._tic_progress.clear()
         for path in paths:
             self.tic_states[path] = a.DatasetTicState(status="queued")
         self._refresh_selected_pane()
         self._execute_tic_batch(paths, fit.settings, intercept, slope)
+
+    def _set_tic_running(self, path):
+        self.tic_states[path] = a.DatasetTicState(status="running")
+        self._tic_progress[path] = "Starting…"
+        self._refresh_selected_pane(refresh_exports=False)
+
+    def _set_tic_progress(self, path, message):
+        state = self.tic_states.get(path)
+        if state is None or state.status != "running":
+            return
+        self._tic_progress[path] = ("Finishing…" if message == "TIC analysis complete" else
+                                    message.removeprefix("Processed ").replace(" MS1 frames", " frames"))
+        self._refresh_selected_pane(refresh_exports=False)
 
     def _finish_tic_batch(self, errors):
         super()._finish_tic_batch(errors)
@@ -260,6 +325,25 @@ class WorkflowMixin:
         return (sum(int(s.tic_below_line) for s in refs) / len(refs),
                 sum(int(s.tic_above_line) for s in refs) / len(refs))
 
+    def _injection_amount(self, metadata, sample_qq, mean_hela_qq):
+        if self._analysis_running or self._tic_running or not self._target_amount_valid:
+            return ""
+        try:
+            volume = Decimal(metadata.volume)
+            unit = (metadata.volume_unit or "").strip().casefold().replace("μ", "u").replace("µ", "u")
+            factor = {"ul": Decimal(1), "nl": Decimal("0.001"),
+                      "ml": Decimal(1000), "l": Decimal(1000000)}.get(unit)
+            sample = Decimal(str(sample_qq))
+            reference = Decimal(str(mean_hela_qq))
+            target = Decimal(str(self.algorithm_settings.target_amount_ng))
+            if (factor is None or not all(value.is_finite() and value > 0
+                                         for value in (volume, sample, reference, target))):
+                return ""
+            amount = reference / sample * (target / Decimal(str(self.algorithm_settings.pm_qc_amount_ng))) * volume * factor
+            return format(amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), "f")
+        except (InvalidOperation, TypeError, ValueError):
+            return ""
+
     def _selected_export_rows(self):
         below_mean, above_mean = self._normalizers()
         line = self._accepted_line()
@@ -276,34 +360,39 @@ class WorkflowMixin:
                 below_relative = above_relative = ""
             rows.append((path.name, self.selected_descriptions.get(path, metadata.description) or "unavailable", a._gradient_length_text(metadata),
                          a.volume_text(metadata), below, below_relative, above, above_relative,
-                         a._fit_cell_text(line) if path == self.chosen_path else ""))
+                         a._fit_cell_text(line) if path == self.chosen_path else "",
+                         self._injection_amount(metadata, below, below_mean)))
         return rows
 
-    def _refresh_selected_pane(self, *, highlighted=None):
+    def _refresh_selected_pane(self, *, highlighted=None, refresh_exports=True):
         selected = self.query_one("#selected-pane", a.SelectedOptionList)
         if highlighted is None:
             highlighted = selected.highlighted
         rows = self._selected_export_rows()
         display_rows = []
-        for row in rows:
+        for path, row in zip(self.selected_paths, rows):
             cells = [str(value) for value in row]
             for index in (5, 7):
                 cells[index] = f"{row[index]:.2%}" if isinstance(row[index], float) else "—"
             for index in (4, 6):
                 if cells[index] == "":
                     cells[index] = "—"
+            state = self.tic_states.get(path)
+            if state is not None and state.status in {"queued", "running"}:
+                cells[4] = "Queued" if state.status == "queued" else self._tic_progress.get(path, "Starting…")
             display_rows.append(cells)
         widths = [max(len(TABLE_HEADER[i]), *(a.cell_len(r[i]) for r in display_rows))
-                  if display_rows else len(TABLE_HEADER[i]) for i in range(9)]
+                  if display_rows else len(TABLE_HEADER[i]) for i in range(len(TABLE_HEADER))]
+        widths[4] = max(12, widths[4])
         widths[0] = max(12, widths[0])
         widths[1] = min(36, max(12, widths[1]))
         region = self.query_one("#selected-region")
         header = Text(" " * 5, no_wrap=True)
-        header.append(" │ ".join(a._column_cell(name, width, right=i in (2,3,4,5,6,7))
+        header.append(" │ ".join(a._column_cell(name, width, right=i in (2,3,4,5,6,7,9))
                                  for i, (name, width) in enumerate(zip(TABLE_HEADER, widths))))
         self.query_one("#selected-header", Static).update(header)
         # Wide numeric columns scroll horizontally; rows never wrap or shorten numbers.
-        minimum_width = sum(widths) + 5 + 3 * 8
+        minimum_width = sum(widths) + 5 + 3 * (len(TABLE_HEADER) - 1)
         region.styles.overflow_x = "auto"
         selected.styles.min_width = minimum_width
         self.query_one("#selected-header").styles.min_width = minimum_width
@@ -316,7 +405,7 @@ class WorkflowMixin:
                          meta={} if self._tic_running else {"remove-selected": index}, bold=True))
             label.append("★ " if reference else "H " if hela else "  ")
             label.append(" │ ".join(a._column_cell(value.replace("\n", " ").replace("\r", " "), width,
-                         right=i in (2,3,4,5,6,7)) for i, (value, width) in enumerate(zip(cells, widths))))
+                         right=i in (2,3,4,5,6,7,9)) for i, (value, width) in enumerate(zip(cells, widths))))
             if reference:
                 label.stylize("bold #ffb86c on #513008", 3)
             elif hela:
@@ -325,7 +414,7 @@ class WorkflowMixin:
         selected.set_options(labels)
         selected.highlighted = min(highlighted or 0, len(labels)-1) if labels else None
         self._update_analysis_actions()
-        self._publish_exports()
+        self._publish_exports(refresh_data=refresh_exports)
 
     def _current_table_widths(self):
         name_width, gradient_width = super()._current_table_widths()
@@ -362,11 +451,25 @@ class WorkflowMixin:
                         for p in self.selected_paths)
                 and any(s.status == "complete" for s in self.tic_states.values()))
 
+    def _update_selected_status(self, index):
+        super()._update_selected_status(index)
+        self._publish_exports()
+
+    def _eligible_reference(self):
+        selected = self.query("#selected-pane")
+        index = selected.first().highlighted if selected else None
+        if index is None or index >= len(self.selected_paths):
+            return False
+        path = self.selected_paths[index]
+        return path in self.hela_paths and not self._missing_metadata(path)
+
     def _browser_actions(self):
         busy = self._tic_running or self._analysis_running
         main_screen = len(self.screen_stack) == 1
         return {
-            "chromatograms": not busy and any(
+            "help": not isinstance(self.screen, a.HelpScreen),
+            "estimate": main_screen and not busy and self._eligible_reference(),
+            "chromatograms": not busy and not self._plot_delivery_busy and any(
                 state.status == "complete" and state.result is not None
                 for path, state in self.tic_states.items() if path in self.selected_paths
             ),
@@ -378,6 +481,7 @@ class WorkflowMixin:
     def _update_analysis_actions(self):
         busy = self._tic_running or self._analysis_running
         actions = self._browser_actions()
+        self.query_one("#estimate-split", Button).disabled = not actions["estimate"]
         self.query_one("#open-tic-plot", Button).disabled = not actions["chromatograms"]
         self.query_one("#redo-analysis", Button).disabled = not actions["rerun"]
         new = self.accepted_fit is not None and any(p not in self.tic_states for p in self.selected_paths)
@@ -393,59 +497,127 @@ class WorkflowMixin:
         with urlopen(request, timeout=5) as response:
             return json.load(response)
 
-    def _publish_exports(self):
-        if not self.bridge_url:
+    def _publish_exports(self, *, refresh_data=False):
+        if not self.bridge_url or self._closing:
             return
         ready = self._results_ready()
-        exports = {}
-        if ready:
+        if not ready:
+            self._export_cache = {}
+        elif refresh_data or not self._export_cache_ready:
             rows = self._selected_export_rows()
-            exports = {
+            self._export_cache = {
                 "selected.tsv": self._delimited_text(TABLE_HEADER, rows, delimiter="\t"),
                 "selected.csv": self._delimited_text(TABLE_HEADER, rows, delimiter=","),
                 "raw-tics.csv": self._delimited_text(
                     ("Path", "Description", "Frame", "Retention Time (s)", "Retention Time", "Raw TIC", "QQ", "Q"),
                     self._raw_tic_export_rows(), delimiter=","),
             }
-        payload = {"ready": ready, "exports": exports, "actions": self._browser_actions()}
+        self._export_cache_ready = ready
+        payload = {"ready": ready, "exports": self._export_cache, "actions": self._browser_actions()}
         if payload == self._last_publication:
             return
+        # Keep one publication in flight and coalesce rapid focus/state updates.
+        self._last_publication = payload
+        self._pending_publication = payload
+        if self._publication_worker is None:
+            self._publication_worker = self.run_worker(
+                self._flush_publications(), group="browser-exports", exit_on_error=False,
+            )
+
+    async def _flush_publications(self):
         try:
-            self._post_browser(payload)
-            self._last_publication = payload
+            while self._pending_publication is not None and not self._closing:
+                payload = self._pending_publication
+                self._pending_publication = None
+                try:
+                    update = payload.copy()
+                    if update["exports"] == self._published_exports:
+                        del update["exports"]
+                    await asyncio.to_thread(self._post_browser, update)
+                    self._published_exports = payload["exports"]
+                except Exception as error:
+                    if self._last_publication == payload:
+                        self._last_publication = None
+                    if not self._closing:
+                        self.query_one("#status-bar", Static).update(f"Browser export failed: {error}")
+        finally:
+            self._publication_worker = None
+
+    def _prepare_plot(self, render, filename, download):
+        content = render()
+        mime = "image/svg+xml"
+        if not download:
+            from .plots import svg_viewer_html
+            content, mime = svg_viewer_html(content, filename), "text/html"
+            filename = filename.removesuffix(".svg") + ".html"
+        url = None
+        if self.bridge_url:
+            result = self._post_browser({"document": {
+                "content": content, "filename": filename, "mime": mime,
+                "disposition": "attachment" if download else "inline",
+            }})
+            url = result["url"] + ("?download=1" if download else "")
+        return content, filename, mime, url
+
+    def _queue_plot(self, render, filename, download=False, screen=None):
+        if self._plot_delivery_busy or self._closing:
+            return None
+        self._plot_delivery_busy = True
+        if screen is not None:
+            screen.set_download_status(True, "Preparing download…")
+        else:
+            self.query_one("#status-bar", Static).update("Preparing plot…")
+        self._update_analysis_actions()
+        self._publish_exports()
+        return self.run_worker(
+            self._deliver_plot(render, filename, download, screen),
+            group="plot-delivery", exit_on_error=False,
+        )
+
+    async def _deliver_plot(self, render, filename, download, screen):
+        message = "Download ready" if download else "Plot ready"
+        try:
+            content, filename, mime, url = await asyncio.to_thread(
+                self._prepare_plot, render, filename, download,
+            )
+            # Closing a review cancels its pending browser launch.
+            if self._closing or (screen is not None and screen not in self.screen_stack):
+                return
+            if url is not None:
+                self.open_url(url, new_tab=True)
+            else:
+                self.deliver_text(io.StringIO(content), save_filename=filename,
+                                  mime_type=mime, encoding="utf-8",
+                                  open_method="download" if download else "browser")
         except Exception as error:
-            self.query_one("#status-bar", Static).update(f"Browser export failed: {error}")
+            message = f"Plot failed: {error}. Try again."
+        finally:
+            self._plot_delivery_busy = False
+            if not self._closing:
+                if screen is not None and screen in self.screen_stack:
+                    screen.set_download_status(False, message)
+                else:
+                    self.query_one("#status-bar", Static).update(message)
+                self._update_analysis_actions()
+                self._publish_exports()
 
     def _deliver_svg(self, svg, filename, download=False):
-        try:
-            if download:
-                content, mime = svg, "image/svg+xml"
-            else:
-                from .plots import svg_viewer_html
-                content, mime = svg_viewer_html(svg, filename), "text/html"
-                filename = filename.removesuffix(".svg") + ".html"
-            if self.bridge_url:
-                result = self._post_browser({"document": {
-                    "content": content, "filename": filename, "mime": mime,
-                    "disposition": "attachment" if download else "inline",
-                }})
-                self.open_url(result["url"] + ("?download=1" if download else ""), new_tab=True)
-                return
-            self.deliver_text(io.StringIO(content), save_filename=filename,
-                              mime_type=mime, encoding="utf-8",
-                              open_method="download" if download else "browser")
-        except Exception as error:
-            self.query_one("#status-bar", Static).update(f"Cannot deliver SVG: {error}")
+        return self._queue_plot(lambda: svg, filename, download)
 
     def open_review_plot(self, screen, download=False):
-        if screen.result is None:
-            return
+        result = screen.result
+        if result is None:
+            return None
         tab = screen.query_one("#scan-tabs", a.TabbedContent).active
         if tab == "scan-fit":
-            return
+            return None
         histogram = tab == "scan-histogram"
-        svg = event_histogram_svg(screen.result) if histogram else a.dominant_charge_svg(screen.result)
-        self._deliver_svg(svg, "event-histogram.svg" if histogram else "dominant-charge.svg", download)
+        render = event_histogram_svg if histogram else a.dominant_charge_svg
+        return self._queue_plot(
+            lambda: render(result),
+            "event-histogram.svg" if histogram else "dominant-charge.svg",
+            download, screen,
+        )
 
     def _finish_charge_scan(self, screen, result, error, traceback_text, advice):
         self._analysis_running = False
@@ -460,10 +632,12 @@ class WorkflowMixin:
                     and self.tic_states[path].status == "complete"
                     and self.tic_states[path].result is not None]
         if datasets:
-            self._deliver_svg(combined_chromatograms_svg(datasets), "chromatograms.svg")
+            return self._queue_plot(lambda: combined_chromatograms_svg(datasets), "chromatograms.svg")
 
-    def on_unmount(self):
+    async def on_unmount(self):
+        self._closing = True
+        self._pending_publication = None
         try:
-            self._post_browser({"ready": False, "exports": {}, "clear": True})
+            await asyncio.to_thread(self._post_browser, {"ready": False, "exports": {}, "clear": True})
         except Exception:
             pass
