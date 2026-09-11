@@ -1631,6 +1631,30 @@ def fit_parameters_text(result: ChargeScanResult) -> Text:
     return output
 
 
+_WORKER_PROGRESS_PATTERN = re.compile(r"^Processed (\d+)/(\d+) MS1 frames$")
+_WORKER_STARTING_PATTERN = re.compile(r"^Processing (\d+) MS1 frames across \d+ workers$")
+
+
+def format_worker_progress_bar(message: str, *, width: int = 6) -> str | None:
+    """Render a charge_regions worker-pool progress message as a short bar.
+
+    Matches "Processing N MS1 frames across P workers" (treated as 0/N) and
+    "Processed {done}/{total} MS1 frames" (one per completed worker chunk,
+    so ~12 steps by default); returns None for anything else so callers can
+    fall back to showing the raw message.
+    """
+    if (match := _WORKER_STARTING_PATTERN.match(message)) is not None:
+        done, total = 0, int(match.group(1))
+    elif (match := _WORKER_PROGRESS_PATTERN.match(message)) is not None:
+        done, total = int(match.group(1)), int(match.group(2))
+    else:
+        return None
+    fraction = done / total if total else 1.0
+    filled = round(fraction * width)
+    bar = "▓" * filled + "░" * (width - filled)
+    return f"{bar} {round(fraction * 100)}%"
+
+
 class ChargeScanScreen(ModalScreen[ChargeScanResult | None]):
     """Confirm, run, and review one charge-region fit in a large modal."""
 
@@ -1889,8 +1913,9 @@ class ChargeScanScreen(ModalScreen[ChargeScanResult | None]):
         )
 
     def set_progress(self, progress: str) -> None:
+        display = format_worker_progress_bar(progress, width=20) or progress
         self.query_one("#scan-loading", Static).update(
-            f"loading charge areas{'.' * self._loading_step}\n{progress}"
+            f"loading charge areas{'.' * self._loading_step}\n{display}"
         )
 
     def show_result(

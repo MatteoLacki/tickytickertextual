@@ -6,7 +6,6 @@ import importlib
 import io
 import json
 import math
-import re
 import time
 from dataclasses import replace
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -54,9 +53,6 @@ TABLE_HEADER = (
     "Path", "Description", "Gradient", "Volume", "QQ", "QQ / QQ-HeLa",
     "Q", "Q / Q-HeLa", "Injection amount (µL)",
 )
-
-_TIC_PROGRESS_PATTERN = re.compile(r"^Processed (\d+)/(\d+) MS1 frames$")
-_TIC_STARTING_PATTERN = re.compile(r"^Processing (\d+) MS1 frames across \d+ workers$")
 
 
 class WorkflowMixin:
@@ -388,23 +384,12 @@ class WorkflowMixin:
     def _format_tic_progress(message: str) -> str:
         if message == "TIC analysis complete":
             return "Finishing…"
-        # "Processing N MS1 frames across P workers" (once, before any chunk
-        # has finished) and "Processed {done}/{total} MS1 frames" (once per
-        # completed worker chunk, so ~12 steps by default - both from the
-        # worker-process split in charge_regions) render as an approximate
-        # bar, kept short so this doesn't widen the QQ column. Anything else
-        # falls back to plain trimmed text.
-        if (match := _TIC_STARTING_PATTERN.match(message)) is not None:
-            done, total = 0, int(match.group(1))
-        elif (match := _TIC_PROGRESS_PATTERN.match(message)) is not None:
-            done, total = int(match.group(1)), int(match.group(2))
-        else:
-            return message.removeprefix("Processed ").replace(" MS1 frames", " frames")
-        fraction = done / total if total else 1.0
-        bar_width = 6
-        filled = round(fraction * bar_width)
-        bar = "▓" * filled + "░" * (bar_width - filled)
-        return f"{bar} {round(fraction * 100)}%"
+        # Kept narrow (vs. the charge-scan screen's wider bar) so this
+        # doesn't widen the QQ column past its 12-character minimum.
+        bar = a.format_worker_progress_bar(message, width=6)
+        if bar is not None:
+            return bar
+        return message.removeprefix("Processed ").replace(" MS1 frames", " frames")
 
     def _update_tic_start_wait(self):
         if self._tic_start_wait is None or not self._tic_running:
