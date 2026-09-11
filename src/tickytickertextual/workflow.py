@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import io
 import json
 import math
@@ -16,9 +17,36 @@ from rich.text import Text
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Button, Header, Input, Label, Static
 
-from . import app as a
 from .browser_driver import BrowserAction
 from .plots import combined_chromatograms_svg, event_histogram_svg
+
+
+class _LazyModule:
+    """Defer importing `app` until first attribute access.
+
+    app.py imports WorkflowMixin from this module, so an eager `from . import
+    app` here is circular. Python's sys.modules cache tolerates that under a
+    normal import (it just hands back the still-initialising app module), but
+    multiprocessing's spawn start method can re-execute app.py under the name
+    __mp_main__ (needed whenever the process's __main__ is
+    tickytickertextual.app, i.e. always, since it's launched via `python -m`)
+    without registering it under its real dotted name - so that tolerance
+    doesn't apply there, and the cycle raises ImportError instead. Deferring
+    the import until an attribute is actually used, well after both modules
+    have finished loading in any context, avoids it.
+    """
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+        self._module = None
+
+    def __getattr__(self, attr: str) -> object:
+        if self._module is None:
+            self._module = importlib.import_module(self._name, __package__)
+        return getattr(self._module, attr)
+
+
+a = _LazyModule(".app")
 
 
 TABLE_HEADER = (
