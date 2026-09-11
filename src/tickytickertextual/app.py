@@ -3963,6 +3963,15 @@ def main(argv: Sequence[str] | None = None) -> None:
     # reaches _posixsubprocess.fork_exec and raises
     # "ValueError: bad value(s) in fds_to_keep".
     multiprocessing.resource_tracker.ensure_running()
+    # Same principle, different hazard: analyse()/analyse_line_tic() split work
+    # across worker processes (frame decompression dominates their runtime and
+    # is single-core CPU-bound). Spawning those workers concurrently with this
+    # app's asyncio event loop (once App.run() starts it) is racy - observed
+    # both BrokenProcessPool and a spurious multiprocessing "bootstrapping
+    # phase" RuntimeError, neither reproducible without that concurrent event
+    # loop. Pre-spawning all of them now, before the loop exists, means later
+    # calls only ever submit work to already-alive workers, which is safe.
+    charge_regions.prewarm_worker_pool()
     args = build_parser().parse_args(argv)
     working_directory = args.working_directory or Path.cwd()
     try:
