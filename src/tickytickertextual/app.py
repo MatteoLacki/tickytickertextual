@@ -8,6 +8,7 @@ import fcntl
 import fnmatch
 import html
 import io
+import multiprocessing.resource_tracker
 import os
 import re
 import stat
@@ -3955,6 +3956,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> None:
+    # Start the resource tracker now, while stderr is still a real fd. Textual's
+    # App.run() redirects sys.stderr to a capture object whose fileno() returns
+    # -1; if numba's parallel njit functions (used by charge_regions.analyse)
+    # lazily start the tracker later via a multiprocessing lock, that -1 fd
+    # reaches _posixsubprocess.fork_exec and raises
+    # "ValueError: bad value(s) in fds_to_keep".
+    multiprocessing.resource_tracker.ensure_running()
     args = build_parser().parse_args(argv)
     working_directory = args.working_directory or Path.cwd()
     try:
