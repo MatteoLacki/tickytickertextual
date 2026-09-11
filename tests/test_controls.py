@@ -98,3 +98,68 @@ def test_tic_progress_stays_in_active_row_and_preserves_selection(tmp_path):
             assert selected.get_option_at_index(0).prompt.plain.split(' │ ')[4].strip() == '12345'
             app._tic_running = False
     asyncio.run(exercise())
+
+
+def test_accept_paints_before_slow_tic_start_and_keeps_ui_responsive(tmp_path, monkeypatch):
+    import threading
+    import time
+    from tickytickertextual import app as a
+    from test_fileviewer import _fake_tic_result
+    hela = make_dataset(tmp_path, 'hela.d', 'HeLa')
+    started, release = threading.Event(), threading.Event()
+    painted = []
+    calls = []
+    display = FileViewerApp._display
+    def capture_display(self, screen, renderable):
+        if renderable is not None:
+            if isinstance(screen, ChargeScanScreen) and screen.state == 'accepted':
+                painted.append('accepted')
+            elif self._tic_running and len(self.screen_stack) == 1:
+                painted.append('main')
+        return display(self, screen, renderable)
+    monkeypatch.setattr(FileViewerApp, '_display', capture_display)
+    def slow_tic(dataset, **kwargs):
+        calls.append((dataset, list(painted)))
+        started.set()
+        release.wait(5)
+        return _fake_tic_result(AlgorithmSettings())
+    monkeypatch.setattr(a.charge_regions, 'analyse_line_tic', slow_tic)
+    async def exercise():
+        app = FileViewerApp(tmp_path)
+        async with app.run_test(size=(190, 50)) as pilot:
+            app.selected_paths = [hela]
+            app.hela_paths = {hela}
+            app._refresh_selected_pane()
+            fit = adapt_charge_scan_result(_fake_charge_result(app.algorithm_settings), app.algorithm_settings)
+            screen = ChargeScanScreen(hela, settings=app.algorithm_settings, metadata=app._dataset_metadata(hela))
+            app.push_screen(screen, lambda result: app._handle_scan_review(hela, result))
+            await pilot.pause()
+            screen.show_result(fit, 'memory')
+            await pilot.pause()
+            try:
+                before = time.monotonic()
+                await pilot.click('#scan-yes')
+                async with asyncio.timeout(1):
+                    while not started.is_set():
+                        await asyncio.sleep(.01)
+                assert time.monotonic() - before < 1
+                assert calls[0][1][0] == 'accepted' and 'main' in calls[0][1]
+                assert len(app.screen_stack) == 1 and app.accepted_fit is fit
+                # A repeated click/decline while acceptance is pending cannot dismiss twice.
+                screen.action_confirm()
+                screen.action_decline()
+                await pilot.pause(1.2)
+                row = app.query_one('#selected-pane', OptionList).get_option_at_index(0).prompt.plain
+                assert 'Starting 1s' in row
+                app.action_show_help()
+                await pilot.pause()
+                assert isinstance(app.screen, HelpScreen)
+                await pilot.press('escape')
+            finally:
+                release.set()
+            async with asyncio.timeout(3):
+                while app._tic_running:
+                    await asyncio.sleep(.01)
+            assert len(calls) == 1
+            assert app.tic_states[hela].status == 'complete'
+    asyncio.run(exercise())

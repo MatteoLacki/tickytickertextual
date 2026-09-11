@@ -163,8 +163,8 @@ while calculation is running.
 Navigation is confined to the root passed on the command line. Symlinks are
 displayed but never followed.
 
-The ten selected-table columns are `Path`, `Description`, `Gradient`, `Volume`,
-`QQ`, `QQ / QQ-HeLa`, `Q`, `Q / Q-HeLa`, `Fit Parameters`, and `Injection amount (µL)`. Rows never wrap;
+The nine selected-table columns are `Path`, `Description`, `Gradient`, `Volume`,
+`QQ`, `QQ / QQ-HeLa`, `Q`, `Q / Q-HeLa`, and `Injection amount (µL)`. Rows never wrap;
 wide tables scroll horizontally. A path ending in `/e/f/g/folder.d` displays
 as `folder.d`. The separate raw CSV has per-frame RT, raw TIC, QQ and Q values.
 
@@ -212,3 +212,15 @@ Each browser start and app restart opens a welcome window with the ASCII logo.
 Click `oh my tickyticker` to enter the file browser. The artwork is read from
 `logoascii.txt` in the app repository, or the existing `logoacsii.txt` spelling;
 installed packages also include a copy of the logo.
+
+The QC settings row also has editable separator **intercept** and **slope**
+fields. Both start at `NA` every session. Accept an estimated fit to fill them,
+or enter finite values manually and click **TIC new folders** to calculate
+pending selected datasets without fitting a reference first. Zero and negative
+coefficients are allowed. Changing the separator clears previous TIC results;
+the next TIC run recalculates selected folders with the new line. These values
+are session-only and do not modify the defaults file.
+
+Accept fit immediately acknowledges the click and draws the main table before
+starting TIC initialization. QQ shows elapsed startup seconds while waiting for
+the first frame-progress report. Progress updates redraw just the active row.

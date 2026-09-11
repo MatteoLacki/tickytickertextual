@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import io
+import json
+import math
+import time
 from dataclasses import replace
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
@@ -21,7 +23,7 @@ from .plots import combined_chromatograms_svg, event_histogram_svg
 
 TABLE_HEADER = (
     "Path", "Description", "Gradient", "Volume", "QQ", "QQ / QQ-HeLa",
-    "Q", "Q / Q-HeLa", "Fit Parameters", "Injection amount (µL)",
+    "Q", "Q / Q-HeLa", "Injection amount (µL)",
 )
 
 
@@ -39,11 +41,17 @@ class WorkflowMixin:
         self._export_cache_ready = False
         self._published_exports = None
         self._tic_progress = {}
+        self._tic_start_wait = None
+        self._selected_display_rows = []
+        self._selected_column_widths = []
         self._last_publication = None
         self._pending_publication = None
         self._publication_worker = None
         self._plot_delivery_busy = False
         self._closing = False
+        self._separator_line = None
+        self._separator_settings = None
+        self._separator_inputs_valid = False
         self._target_amount_valid = True
         super().__init__(*args, **kwargs)
 
@@ -68,6 +76,10 @@ class WorkflowMixin:
             yield Input(str(self.algorithm_settings.pm_qc_amount_ng), type="number", id="pm-qc-amount-ng")
             yield Label("MM target amount (ng)")
             yield Input(str(self.algorithm_settings.target_amount_ng), type="number", id="target-amount-ng")
+            yield Label("separator: intercept=")
+            yield Input(placeholder="NA", type="number", id="separator-intercept")
+            yield Label("slope=")
+            yield Input(placeholder="NA", type="number", id="separator-slope")
             yield Static(id="target-error")
         with Horizontal(id="analysis-actions"):
             yield Button("Help", id="show-help")
@@ -75,17 +87,22 @@ class WorkflowMixin:
             yield Button("See Chromatograms", id="open-tic-plot", disabled=True)
             yield Button("TIC new folders", id="tic-new", disabled=True)
             yield Button("Rerun", id="redo-analysis", disabled=True)
-        yield Static("Highlight a blue HeLa in :selected:, click Estimate charge split, then Calculate.",
+        yield Static("Enter separator values and click TIC new folders, or highlight a HeLa and click Estimate charge split.",
                      id="analysis-hint")
         yield Static(id="status-bar")
 
     def on_mount(self, event):
         event.prevent_default()
         super().on_mount()
+        self.set_interval(0.25, self._update_tic_start_wait)
         if self.bridge_url:
             self.query_one("#analysis-actions").display = False
 
     def on_input_changed(self, event: Input.Changed):
+        if event.input.id in {"separator-intercept", "separator-slope"}:
+            event.stop()
+            self._separator_changed()
+            return
         if event.input.id not in {"target-amount-ng", "pm-qc-amount-ng"}:
             return
         event.stop()
@@ -102,6 +119,36 @@ class WorkflowMixin:
             self.algorithm_settings = settings
             self.query_one("#target-error", Static).update("")
         self._refresh_selected_pane()
+
+    def _set_separator_line(self, line, settings):
+        self._separator_line = line
+        self._separator_settings = settings
+        self._separator_inputs_valid = True
+        with self.prevent(Input.Changed):
+            self.query_one("#separator-intercept", Input).value = str(line[0])
+            self.query_one("#separator-slope", Input).value = str(line[1])
+
+    def _separator_changed(self):
+        try:
+            line = tuple(float(self.query_one(selector, Input).value)
+                         for selector in ("#separator-intercept", "#separator-slope"))
+            valid = all(math.isfinite(value) for value in line)
+        except ValueError:
+            valid = False
+        self._separator_inputs_valid = valid
+        if valid and line != self._separator_line:
+            self._separator_line = line
+            self._separator_settings = self.algorithm_settings
+            # Never normalize results calculated with different separators together.
+            self.tic_states.clear()
+            self._tic_progress.clear()
+            self._refresh_selected_pane()
+            self.query_one("#status-bar", Static).update(
+                "Separator changed · click TIC new folders to calculate selected folders"
+            )
+        else:
+            self._update_analysis_actions()
+            self._publish_exports()
 
     def _apply_algorithm_settings(self, settings):
         super()._apply_algorithm_settings(settings)
@@ -121,7 +168,7 @@ class WorkflowMixin:
         elif event.action == "rerun":
             self._request_main_redo()
         elif event.action == "tic-new":
-            self._begin_tic_batch(self.accepted_fit, only_new=True)
+            self._begin_tic_batch(only_new=True)
 
     def on_descendant_focus(self, event):
         # Keep the browser toolbar in sync when a modal opens or closes.
@@ -263,18 +310,24 @@ class WorkflowMixin:
         elif event.button.id == "estimate-split":
             self.action_choose_reference()
         elif event.button.id == "tic-new":
-            if self.accepted_fit is not None:
-                self._begin_tic_batch(self.accepted_fit, only_new=True)
+            self._begin_tic_batch(only_new=True)
         else:
             super().on_button_pressed(event)
 
-    def _begin_tic_batch(self, fit, only_new=False):
+    def _begin_tic_batch(self, fit=None, only_new=False):
         if self._tic_running or self._analysis_running:
             return
+        if fit is not None:
+            self._set_separator_line(self._line_from_result(fit), fit.settings)
+        else:
+            self._separator_changed()
         paths = tuple(path for path in self.selected_paths if not only_new or path not in self.tic_states)
         if not paths:
             return
-        intercept, slope = self._line_from_result(fit)
+        if not self._separator_inputs_valid or self._separator_line is None:
+            return
+        intercept, slope = self._separator_line
+        settings = self._separator_settings or self.algorithm_settings
         self._tic_running = True
         if not only_new:
             self.tic_states.clear()
@@ -282,20 +335,54 @@ class WorkflowMixin:
         for path in paths:
             self.tic_states[path] = a.DatasetTicState(status="queued")
         self._refresh_selected_pane()
-        self._execute_tic_batch(paths, fit.settings, intercept, slope)
+        # Paint the main screen and queued rows before raw-data initialization.
+        self.call_after_refresh(self._execute_tic_batch, paths, settings, intercept, slope)
 
     def _set_tic_running(self, path):
         self.tic_states[path] = a.DatasetTicState(status="running")
         self._tic_progress[path] = "Starting…"
-        self._refresh_selected_pane(refresh_exports=False)
+        self._tic_start_wait = (path, time.monotonic())
+        self._refresh_tic_row(path)
 
     def _set_tic_progress(self, path, message):
         state = self.tic_states.get(path)
         if state is None or state.status != "running":
             return
+        self._tic_start_wait = None
         self._tic_progress[path] = ("Finishing…" if message == "TIC analysis complete" else
                                     message.removeprefix("Processed ").replace(" MS1 frames", " frames"))
-        self._refresh_selected_pane(refresh_exports=False)
+        self._refresh_tic_row(path)
+
+    def _update_tic_start_wait(self):
+        if self._tic_start_wait is None or not self._tic_running:
+            return
+        path, started = self._tic_start_wait
+        elapsed = int(time.monotonic() - started)
+        if elapsed < 1:
+            return
+        message = f"Starting {elapsed}s"
+        if self._tic_progress.get(path) != message:
+            self._tic_progress[path] = message
+            self._refresh_tic_row(path)
+
+    def _set_tic_result(self, path, result, error):
+        self._tic_start_wait = None
+        super()._set_tic_result(path, result, error)
+
+    def _refresh_tic_row(self, path):
+        if path not in self.selected_paths:
+            return
+        index = self.selected_paths.index(path)
+        progress = self._tic_progress[path]
+        if (len(self._selected_display_rows) != len(self.selected_paths)
+                or a.cell_len(progress) > self._selected_column_widths[4]):
+            self._refresh_selected_pane(refresh_exports=False)
+            return
+        cells = self._selected_display_rows[index]
+        cells[4] = progress
+        self.query_one("#selected-pane", a.SelectedOptionList).replace_option_prompt_at_index(
+            index, self._selected_row_label(index, path, cells, self._selected_column_widths),
+        )
 
     def _finish_tic_batch(self, errors):
         super()._finish_tic_batch(errors)
@@ -346,7 +433,6 @@ class WorkflowMixin:
 
     def _selected_export_rows(self):
         below_mean, above_mean = self._normalizers()
-        line = self._accepted_line()
         rows = []
         for path in self.selected_paths:
             metadata = self._dataset_metadata(path)
@@ -360,7 +446,6 @@ class WorkflowMixin:
                 below_relative = above_relative = ""
             rows.append((path.name, self.selected_descriptions.get(path, metadata.description) or "unavailable", a._gradient_length_text(metadata),
                          a.volume_text(metadata), below, below_relative, above, above_relative,
-                         a._fit_cell_text(line) if path == self.chosen_path else "",
                          self._injection_amount(metadata, below, below_mean)))
         return rows
 
@@ -388,7 +473,7 @@ class WorkflowMixin:
         widths[1] = min(36, max(12, widths[1]))
         region = self.query_one("#selected-region")
         header = Text(" " * 5, no_wrap=True)
-        header.append(" │ ".join(a._column_cell(name, width, right=i in (2,3,4,5,6,7,9))
+        header.append(" │ ".join(a._column_cell(name, width, right=i in (2,3,4,5,6,7,8))
                                  for i, (name, width) in enumerate(zip(TABLE_HEADER, widths))))
         self.query_one("#selected-header", Static).update(header)
         # Wide numeric columns scroll horizontally; rows never wrap or shorten numbers.
@@ -396,25 +481,29 @@ class WorkflowMixin:
         region.styles.overflow_x = "auto"
         selected.styles.min_width = minimum_width
         self.query_one("#selected-header").styles.min_width = minimum_width
-        labels = []
-        for index, (path, cells) in enumerate(zip(self.selected_paths, display_rows)):
-            reference = path == (self._pending_reference or self.chosen_path)
-            hela = path in self.hela_paths
-            label = Text(no_wrap=True, overflow="ellipsis")
-            label.append(" × ", style=Style(color="#777777" if self._tic_running else "#ff7b72",
-                         meta={} if self._tic_running else {"remove-selected": index}, bold=True))
-            label.append("★ " if reference else "H " if hela else "  ")
-            label.append(" │ ".join(a._column_cell(value.replace("\n", " ").replace("\r", " "), width,
-                         right=i in (2,3,4,5,6,7,9)) for i, (value, width) in enumerate(zip(cells, widths))))
-            if reference:
-                label.stylize("bold #ffb86c on #513008", 3)
-            elif hela:
-                label.stylize("#8bc5ff on #12335b", 3)
-            labels.append(label)
+        self._selected_display_rows = display_rows
+        self._selected_column_widths = widths
+        labels = [self._selected_row_label(index, path, cells, widths)
+                  for index, (path, cells) in enumerate(zip(self.selected_paths, display_rows))]
         selected.set_options(labels)
         selected.highlighted = min(highlighted or 0, len(labels)-1) if labels else None
         self._update_analysis_actions()
         self._publish_exports(refresh_data=refresh_exports)
+
+    def _selected_row_label(self, index, path, cells, widths):
+        reference = path == (self._pending_reference or self.chosen_path)
+        hela = path in self.hela_paths
+        label = Text(no_wrap=True, overflow="ellipsis")
+        label.append(" × ", style=Style(color="#777777" if self._tic_running else "#ff7b72",
+                     meta={} if self._tic_running else {"remove-selected": index}, bold=True))
+        label.append("★ " if reference else "H " if hela else "  ")
+        label.append(" │ ".join(a._column_cell(value.replace("\n", " ").replace("\r", " "), width,
+                     right=i in (2,3,4,5,6,7,8)) for i, (value, width) in enumerate(zip(cells, widths))))
+        if reference:
+            label.stylize("bold #ffb86c on #513008", 3)
+        elif hela:
+            label.stylize("#8bc5ff on #12335b", 3)
+        return label
 
     def _current_table_widths(self):
         name_width, gradient_width = super()._current_table_widths()
@@ -474,7 +563,7 @@ class WorkflowMixin:
                 for path, state in self.tic_states.items() if path in self.selected_paths
             ),
             "rerun": main_screen and not busy and self.chosen_path is not None and self.accepted_fit is not None,
-            "tic-new": main_screen and not busy and self.accepted_fit is not None
+            "tic-new": main_screen and not busy and self._separator_inputs_valid and self._separator_line is not None
                        and any(path not in self.tic_states for path in self.selected_paths),
         }
 
@@ -484,10 +573,12 @@ class WorkflowMixin:
         self.query_one("#estimate-split", Button).disabled = not actions["estimate"]
         self.query_one("#open-tic-plot", Button).disabled = not actions["chromatograms"]
         self.query_one("#redo-analysis", Button).disabled = not actions["rerun"]
-        new = self.accepted_fit is not None and any(p not in self.tic_states for p in self.selected_paths)
+        new = any(p not in self.tic_states for p in self.selected_paths)
         button = self.query_one("#tic-new", Button)
         button.display = new
-        button.disabled = busy or not new
+        button.disabled = not actions["tic-new"]
+        self.query_one("#separator-intercept", Input).disabled = busy
+        self.query_one("#separator-slope", Input).disabled = busy
 
     def _post_browser(self, payload):
         if not self.bridge_url:

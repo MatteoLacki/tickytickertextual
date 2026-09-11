@@ -311,7 +311,7 @@ def test_dot_d_preview_shows_cached_metadata_and_file_sizes(
                     "Description",
                     "QQ / QQ-HeLa",
                     "Q / Q-HeLa",
-                    "Fit Parameters",
+                    "Injection amount (µL)",
                 )
             )
             assert "Below" not in selected_row
@@ -768,8 +768,9 @@ def test_modal_review_svg_and_accepted_split_tic(
             )
             assert "100" in selected_row and "200" in selected_row
             assert selected_row.count("100.00%") == 2
-            assert "a=1.55" in selected_row
-            assert "b=-0.0005" in selected_row
+            assert "a=1.55" not in selected_row
+            assert app.query_one("#separator-intercept", Input).value == "1.55"
+            assert app.query_one("#separator-slope", Input).value == "-0.0005"
             assert "Below" not in selected_row
             assert "Above" not in selected_row
 
@@ -855,7 +856,8 @@ def test_split_tic_continues_after_dataset_error(
             assert "50.00%" in sample_row
             assert "200.00%" in sample_row
             assert broken_row.count("ERROR") == 2
-            assert "a=1.55" in hela_row
+            assert "a=1.55" not in hela_row
+            assert app.query_one("#separator-intercept", Input).value == "1.55"
             assert "a=1.55" not in sample_row
             assert "a=1.55" not in broken_row
             separators = [

@@ -13,6 +13,7 @@ from test_fileviewer import _fake_charge_result, _fake_tic_result, _write_sample
 
 class BrowserFixture(FileViewerApp):
     BINDINGS = [Binding("f2", "review_fixture", show=False),
+                Binding("f3", "focus_separator_fixture", show=False),
                 Binding("f4", "chrom_fixture", show=False),
                 Binding("f5", "download_fixture", show=False),
                 Binding("f6", "dominant_fixture", show=False)]
@@ -39,8 +40,11 @@ class BrowserFixture(FileViewerApp):
     def action_review_fixture(self):
         screen = ChargeScanScreen(self.chosen_path, settings=self.algorithm_settings,
                                   metadata=self._dataset_metadata(self.chosen_path))
-        self.push_screen(screen)
+        self.push_screen(screen, lambda result: self._handle_scan_review(self.chosen_path, result))
         self.call_after_refresh(lambda: screen.show_result(self.accepted_fit, "memory"))
+
+    def action_focus_separator_fixture(self):
+        self.query_one("#separator-intercept").focus()
 
     def action_chrom_fixture(self):
         self._open_selected_tic_plot()
@@ -86,4 +90,10 @@ if __name__ == "__main__":
                             bridge_token="browser-test", templates_path=Path(__file__).resolve().parents[1] / "src/tickytickertextual/templates")
         server.serve()
     else:
+        import time
+        from tickyticker import charge_regions
+        def slow_tic(dataset, **kwargs):
+            time.sleep(3)
+            return _fake_tic_result(AlgorithmSettings(), below=round(kwargs["intercept"] * 1000), above=100)
+        charge_regions.analyse_line_tic = slow_tic
         BrowserFixture(args.root, bridge_url="http://127.0.0.1:18979", bridge_token="browser-test").run()

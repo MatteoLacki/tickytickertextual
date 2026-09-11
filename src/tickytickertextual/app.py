@@ -1845,7 +1845,7 @@ class ChargeScanScreen(ModalScreen[ChargeScanResult | None]):
         )
 
     def action_decline(self) -> None:
-        if self.state != "loading":
+        if self.state in {"confirm", "review"}:
             self.dismiss(None)
 
     def action_confirm(self) -> None:
@@ -1854,7 +1854,15 @@ class ChargeScanScreen(ModalScreen[ChargeScanResult | None]):
             self.post_message(self.ScanRequested(self))
         elif self.state == "review" and self.result is not None:
             self.state = "accepted"
-            self.dismiss(self.result)
+            self.query_one("#scan-yes", Button).label = "Accepted…"
+            for button in self.query("#scan-buttons Button"):
+                button.disabled = True
+            # Acknowledge the click before dismissing and starting the TIC pass.
+            self.call_after_refresh(self._dismiss_accepted)
+
+    def _dismiss_accepted(self) -> None:
+        # Do not return dismiss's awaitable to the screen's refresh callback.
+        self.dismiss(self.result)
 
     def show_loading(self) -> None:
         self.state = "loading"
@@ -2461,7 +2469,7 @@ class HelpScreen(ModalScreen[None]):
   Ctrl+Up           return focus to the filesystem pane
   Click             focus a row in :selected:
   Selected row      folder | Description | Gradient | Volume | QQ | QQ/HeLa
-                    | Q | Q/HeLa | Fit | Injection amount (scroll horizontally)
+                    | Q | Q/HeLa | Injection amount (scroll horizontally)
   j/k or arrows     move through selected paths
   g/G               jump to first/last selected path
   Blue rows         HeLa normalization group (auto-detected from Description)
@@ -2477,7 +2485,9 @@ class HelpScreen(ModalScreen[None]):
   Accept fit        run thresholded below/above TIC for every selected path
                     then normalize by the mean of enabled successful HeLas
   Rerun             edit parameters and repeat fitting and every TIC calculation
-  TIC new folders   apply accepted line/settings only to newly added datasets
+  Separator fields  enter finite intercept and slope, or accept an estimated fit
+                    (start at NA; changing the line clears prior TIC results)
+  TIC new folders   calculate pending folders with the displayed separator
   See Chromatograms open all completed datasets in one stacked plot
   Reject/Cancel     preserve the previous completed analysis and selected paths
   x or click ×      remove the current path (disabled/grey during TIC processing)
@@ -2634,6 +2644,13 @@ class FileViewerShell(App[None]):
     }
     #target-amount-ng, #pm-qc-amount-ng {
         width: 14;
+    }
+    #separator-intercept, #separator-slope {
+        width: 16;
+    }
+    #injection-settings {
+        overflow-x: auto;
+        overflow-y: hidden;
     }
     #target-error {
         width: 1fr;
