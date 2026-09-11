@@ -19,8 +19,6 @@ dependencies = [
     "aiohttp-jinja2>=1.6,<2",
 ]
 
-[tool.uv.sources]
-tickyticker = { path = "../..", editable = true }
 
 [project.optional-dependencies]
 dev = [
